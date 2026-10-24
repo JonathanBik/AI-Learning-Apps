@@ -213,7 +213,9 @@
       [t.term].concat(t.aka || []).forEach((a) => {
         const key = a.toLowerCase();
         // two or more capitals (TTFT, KV cache, PagedAttention) → match case-sensitively
-        if (!map.has(key)) map.set(key, { id: t.id, alias: a, cs: /[A-Z].*[A-Z]/.test(a) });
+        const cs = /[A-Z].*[A-Z]/.test(a);
+        if (!map.has(key)) map.set(key, { id: t.id, aliases: [a], cs });
+        else if (map.get(key).id === t.id) { map.get(key).aliases.push(a); map.get(key).cs = map.get(key).cs && cs; }
       });
     });
     const keys = [...map.keys()].sort((a, b) => b.length - a.length).map((k) => k.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
@@ -245,7 +247,7 @@
         let changed = false;
         while ((m = matcher.re.exec(text))) {
           const hit = matcher.map.get(m[1].toLowerCase());
-          if (!hit || seen.has(hit.id) || (hit.cs && m[1] !== hit.alias)) continue;
+          if (!hit || seen.has(hit.id) || (hit.cs && !hit.aliases.includes(m[1]))) continue;
           seen.add(hit.id);
           found.add(hit.id);
           frag.appendChild(document.createTextNode(text.slice(last, m.index)));
@@ -268,7 +270,7 @@
     const text = String(str).replace(/<[^>]+>/g, " ");
     matcher.re.lastIndex = 0;
     let m;
-    while ((m = matcher.re.exec(text))) { const hit = matcher.map.get(m[1].toLowerCase()); if (hit && !(hit.cs && m[1] !== hit.alias) && !out.includes(hit.id)) out.push(hit.id); }
+    while ((m = matcher.re.exec(text))) { const hit = matcher.map.get(m[1].toLowerCase()); if (hit && !(hit.cs && !hit.aliases.includes(m[1])) && !out.includes(hit.id)) out.push(hit.id); }
     return out;
   };
 

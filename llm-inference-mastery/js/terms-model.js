@@ -423,16 +423,40 @@
     {
       id: "parameters",
       term: "Parameters (weights)",
-      aka: ["parameters", "weights", "model weights"],
-      auto: false,
+      aka: ["parameters", "parameter count", "model weights", "weight matrices", "weight matrix"],
       cat: "model",
-      short: "The learned numbers inside the model's matrices; their count is the “70B” in a model's name.",
-      long: "Weight memory = parameters × bytes per parameter. Every decode step must read all active weights from HBM, so weight bytes set the floor on TPOT. Quantization shrinks bytes per parameter; MoE shrinks how many are read per token.",
-      analogy: "the model's entire learned memory, stored as numbers.",
-      formula: "weight memory = params × bytes/param\ndecode floor ≈ weight bytes ÷ HBM bandwidth",
-      example: () => `70.6B × 2 B (FP16) = <b>${fmt.bytes(70.6e9 * 2, 0)}</b>; FP8 ${fmt.bytes(70.6e9, 0)}; INT4 ${fmt.bytes(70.6e9 * 0.5, 0)}.`,
-      viz: (G) => G.bars([{ label: "FP16", value: 141, color: "var(--hbm)" }, { label: "FP8", value: 70.6, color: "var(--warn)" }, { label: "INT4", value: 35.3, color: "var(--good)" }], { fmt: (v) => v + " GB" }),
-      related: ["quantization", "hbm", "moe", "decode"],
+      short: "The numbers the model learned during training. They fill its weight matrices, and their count is the “70B” in a model's name.",
+      long: "Every layer multiplies its input by weight matrices, and each entry of those matrices is one parameter. A layer with 3 inputs and 2 outputs is a 2 × 3 matrix: <b>6 parameters</b>. Llama-3-70B has <b>70.6 billion</b>, almost 80% of them in the MLP blocks. The count drives the two costs that matter for serving: <b>memory</b> (every parameter must sit in GPU memory) and <b>work</b> (each one is used once per token, as 2 FLOPs).",
+      analogy: "the model's knowledge stored as billions of adjustable dials, each set to one number during training.",
+      formula: "weight memory = params × bytes per param   (FP16 = 2 B, FP8 = 1 B, INT4 = 0.5 B)\nFLOPs per token ≈ 2 × params   (one multiply + one add each)\ndecode floor ≈ weight bytes ÷ HBM bandwidth",
+      example: () => `70.6B × 2 B (FP16) = <b>${fmt.bytes(70.6e9 * 2, 0)}</b> of weights: more than one 80 GB H100 holds, so it is split over several GPUs. FP8 halves it to ${fmt.bytes(70.6e9, 0)}, INT4 to ${fmt.bytes(70.6e9 * 0.5, 1)}. Every decode step of our answer reads all of them, and each token costs ≈ 2 × 70.6B = ${fmt.si(2 * 70.6e9, 0)} FLOPs.`,
+      viz: (G) => {
+        // toy layer: W (2×3) · x (3) = y (2) → 6 parameters, 12 FLOPs
+        const W = [[0.2, -1.0, 0.5], [0.7, 0.1, -0.4]], x = [1, 2, 3];
+        const sv = LIA.svg(280, 92), c = 30;
+        W.forEach((row, i) => row.forEach((v, j) => {
+          sv.appendChild(s("rect", { x: 4 + j * c, y: 18 + i * c, width: c - 3, height: c - 3, rx: 3, fill: "var(--hbm)", opacity: 0.25 + Math.abs(v) * 0.6 }));
+          sv.appendChild(s("text", { x: 4 + j * c + (c - 3) / 2, y: 18 + i * c + 18, "text-anchor": "middle", "font-size": 10, fill: "var(--ink)" }, v.toFixed(1)));
+        }));
+        sv.appendChild(s("text", { x: 4, y: 12, "font-size": 9.5, fill: "var(--muted)" }, "W: 6 parameters"));
+        sv.appendChild(s("text", { x: 100, y: 52, "font-size": 15, fill: "var(--muted)" }, "×"));
+        x.forEach((v, i) => { sv.appendChild(s("rect", { x: 118, y: 4 + i * 26, width: 24, height: 23, rx: 3, fill: "var(--accent)", opacity: 0.3 })); sv.appendChild(s("text", { x: 130, y: 20 + i * 26, "text-anchor": "middle", "font-size": 10, fill: "var(--ink)" }, v)); });
+        sv.appendChild(s("text", { x: 150, y: 52, "font-size": 15, fill: "var(--muted)" }, "="));
+        const y = W.map((r) => r.reduce((a, v, j) => a + v * x[j], 0));
+        y.forEach((v, i) => { sv.appendChild(s("rect", { x: 168, y: 18 + i * c, width: 34, height: c - 3, rx: 3, fill: "var(--compute)", opacity: 0.35 })); sv.appendChild(s("text", { x: 185, y: 36 + i * c, "text-anchor": "middle", "font-size": 10, fill: "var(--ink)" }, v.toFixed(1))); });
+        sv.appendChild(s("text", { x: 210, y: 36, "font-size": 9.5, fill: "var(--ink)" }, "6 multiplies"));
+        sv.appendChild(s("text", { x: 210, y: 50, "font-size": 9.5, fill: "var(--ink)" }, "+ 6 adds"));
+        sv.appendChild(s("text", { x: 210, y: 64, "font-size": 9.5, "font-weight": 600, fill: "var(--compute)" }, "= 12 FLOPs"));
+        sv.appendChild(s("text", { x: 4, y: 88, "font-size": 9.5, fill: "var(--muted)" }, "Llama-3-70B: same idea, 70.6 billion times"));
+        // where the 70.6B live (per layer: attention 151M, MLP 705M; × 80 layers; + embeddings and LM head)
+        const bars = G.bars([
+          { label: "MLP", value: 56.37, color: "var(--compute)" },
+          { label: "Attention", value: 12.08, color: "var(--accent)" },
+          { label: "Embed + head", value: 2.1, color: "var(--muted)" },
+        ], { fmt: (v) => fmt.num(v, 1) + "B", labelW: 76 });
+        return LIA.h("div", { style: { display: "grid", gap: "6px" } }, sv, bars);
+      },
+      related: ["flops", "quantization", "hbm", "mlp", "moe"],
       topic: "q12",
     },
     {

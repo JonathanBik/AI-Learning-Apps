@@ -6,7 +6,7 @@ The worked example follows one mocked request, *“What is the capital of France
 
 ### Terms explained in place
 
-Jargon is tappable. Terms like *TTFT*, *HBM*, *GQA*, *continuous batching* or *all-reduce* are underlined wherever they appear in ledes, key ideas, worked-example notes and quiz explanations. Tapping one opens a card with a plain one-line definition, a mini picture, how it works and why it matters, an everyday analogy, the formula, what it means for the mocked request, related terms, and a link to its lab. Each topic starts with a **Key terms** strip, and the **Glossary** page (`#glossary`) lists all 183 terms with search and category filters.
+Jargon is tappable. Terms like *TTFT*, *HBM*, *GQA*, *continuous batching* or *all-reduce* are underlined wherever they appear in ledes, key ideas, worked-example notes and quiz explanations. Tapping one opens a card with a plain one-line definition, a mini picture, how it works and why it matters, an everyday analogy, the formula, what it means for the mocked request, related terms, and a link to its lab. Each topic starts with a **Key terms** strip, and the **Glossary** page (`#glossary`) lists all 184 terms with search and category filters.
 
 ## Run it
 
