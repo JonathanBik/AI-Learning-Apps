@@ -414,3 +414,4 @@ textarea { width: 100%; resize: vertical; line-height: 1.5; }
 .kt-card .gl-term { font-size: 15px; }
 .kt-card .gl-viz { pointer-events: none; }
 .gpop.center { position: fixed; left: 50%; top: 50%; transform: translate(-50%, -50%); }
+.gpop > *, .kt-card > * { flex-shrink: 0; }
