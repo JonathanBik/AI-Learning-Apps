@@ -418,4 +418,302 @@
         explain: "Goodput is the useful throughput under SLO. It is the number to size and compare fleets with." },
     ],
   });
+  /* =====================================================================
+   * Worked examples: the shared mocked request (LIA.MOCK) through Q16–Q18
+   * ===================================================================== */
+  // One mocked timeline for this request (ms since it hit the gateway), shared by Q16 and Q18.
+  const TL = { parse: 0.8, tok: 2.1, qEnd: 14.0, pEnd: 19.6, first: 20.1, tokens: [20.1, 44.3, 68.2, 92.6, 116.4, 140.9, 165.0, 189.2], done: 189.6 };
+  const ttftMs = TL.first, e2eMs = TL.done;
+  const tpotMs = (TL.tokens[7] - TL.tokens[0]) / 7;
+  const queueMs = TL.qEnd - TL.tok;
+  /** Prometheus histogram_quantile: linear interpolation inside the bucket */
+  function promQuantile(q, buckets) { // buckets: [[le, cumulativeCount]]
+    const total = buckets[buckets.length - 1][1];
+    const rank = q * total;
+    for (let i = 0; i < buckets.length; i++) {
+      if (buckets[i][1] >= rank) {
+        const [le, c] = buckets[i];
+        const [ple, pc] = i ? buckets[i - 1] : [0, 0];
+        return ple + (le - ple) * ((rank - pc) / (c - pc));
+      }
+    }
+    return buckets[buckets.length - 1][0];
+  }
+  function spanChart(spans, W = 340, max) {
+    const H = 18 + spans.length * 20;
+    const sv = LIA.svg(W, H, { "aria-label": "Span timeline" });
+    const lab = 92, X = (v) => lab + (v / max) * (W - lab - 8);
+    spans.forEach((sp, i) => {
+      const y = 6 + i * 20;
+      sv.appendChild(s("text", { x: lab - 6, y: y + 12, "text-anchor": "end", "font-size": 10.5, fill: "var(--ink)" }, sp[0]));
+      sv.appendChild(s("rect", { x: X(sp[1]), y: y + 2, width: Math.max(2, X(sp[2]) - X(sp[1])), height: 13, rx: 2, fill: sp[3] }));
+    });
+    sv.appendChild(s("text", { x: W - 8, y: H - 2, "text-anchor": "end", "font-size": 10, fill: "var(--muted)" }, `0 → ${fmt.num(max, 0)} ms`));
+    return sv;
+  }
+
+  LIA.topics.q16.trace = (M) => {
+    const N = M.prompt.length, out = M.output.length;
+    const prefixHit = 12; // <|begin_of_text|> … <|eot_id|> of the shared system prompt (tokens 0–11)
+    const ttftB = [0.001, 0.005, 0.01, 0.02, 0.04, 0.06, 0.08, 0.1, 0.25, 0.5];
+    const tpotB = [0.01, 0.025, 0.05, 0.075, 0.1, 0.15, 0.2, 0.3];
+    // mocked 5-minute window: cumulative bucket counts before this request lands
+    const windowCum = [0, 3, 41, 380, 1702, 2410, 2655, 2733, 2790, 2801];
+    const after = windowCum.map((c, i) => c + (ttftB[i] >= ttftMs / 1000 ? 1 : 0));
+    const q50 = promQuantile(0.5, ttftB.map((le, i) => [le, after[i]]));
+    const q99 = promQuantile(0.99, ttftB.map((le, i) => [le, after[i]]));
+    const histo = (bounds, val, title) => {
+      const W = 340, H = 92, bw = (W - 10) / bounds.length;
+      const sv = LIA.svg(W, H, { "aria-label": title });
+      bounds.forEach((le, i) => {
+        const hit = le >= val;
+        sv.appendChild(s("rect", { x: 5 + i * bw, y: 20, width: bw - 3, height: 36, rx: 3, fill: hit ? "var(--accent)" : "var(--surface-2)", stroke: "var(--line)", opacity: hit ? 0.75 : 1 }));
+        sv.appendChild(s("text", { x: 5 + i * bw + (bw - 3) / 2, y: 42, "text-anchor": "middle", "font-size": 10, fill: hit ? "var(--surface)" : "var(--muted)" }, hit ? "+1" : "·"));
+        sv.appendChild(s("text", { x: 5 + i * bw + (bw - 3) / 2, y: 70, "text-anchor": "middle", "font-size": 9, fill: "var(--muted)" }, le < 0.1 ? String(le * 1000) : String(le)));
+      });
+      sv.appendChild(s("text", { x: 5, y: 13, "font-size": 10.5, fill: "var(--ink)" }, title));
+      sv.appendChild(s("text", { x: 5, y: 86, "font-size": 9.5, fill: "var(--muted)" }, "le (ms below 0.1 s, else s) · cumulative: every bucket ≥ value gets +1"));
+      return sv;
+    };
+    return [
+      {
+        k: "Raw events", op: "engine + gateway logs", where: "per request",
+        input: () => LIA.tokens(M.prompt.slice(16, 23), { ids: false, cls: () => "hl" }),
+        output: () => LIA.blob([
+          `<span class="dim">t=  0.0</span> gateway  recv   ${M.id}`,
+          `<span class="dim">t=${fmt.num(TL.parse, 1).padStart(5)}</span> api      parsed chat template`,
+          `<span class="dim">t=${fmt.num(TL.tok, 1).padStart(5)}</span> api      tokenized prompt_tokens=${N}`,
+          `<span class="dim">t=${fmt.num(TL.qEnd, 1).padStart(5)}</span> sched    admitted blocks=2 prefix_hit=${prefixHit}`,
+          `<span class="dim">t=${fmt.num(TL.pEnd, 1).padStart(5)}</span> engine   prefill done`,
+          ...M.output.map((t, i) => `<span class="dim">t=${fmt.num(TL.tokens[i], 1).padStart(5)}</span> stream   token ${i + 1} <span class="hl">${LIA.esc(LIA.showTok(t.t))}</span>`),
+          `<span class="dim">t=${fmt.num(TL.done, 1).padStart(5)}</span> stream   [DONE] finish_reason=stop`].join("\n")),
+        note: "All timestamps are mocked but internally consistent. Everything below is derived from these 14 lines.",
+      },
+      {
+        k: "Span tree", op: "OpenTelemetry trace", where: "gateway → api → scheduler → engine",
+        input: () => LIA.kv([["trace_id", "4bf92f35…"], ["request_id", M.id], ["model", M.request.model]]),
+        output: () => spanChart([
+          ["request", 0, TL.done, "var(--accent)"], ["parse", 0, TL.parse, "var(--muted)"], ["tokenize", TL.parse, TL.tok, "var(--muted)"],
+          ["queue", TL.tok, TL.qEnd, "var(--warn)"], ["prefill", TL.qEnd, TL.pEnd, "var(--compute)"], ["decode ×7", TL.tokens[0], TL.tokens[7], "var(--hbm)"]], 340, TL.done),
+        note: "Spans make the queue visible. Here 12 of the 20 ms before the first token were spent waiting for admission, not computing.",
+      },
+      {
+        k: "Derive metrics", op: "per-request summary", where: "on finish",
+        input: () => LIA.blob(`first_token_t = ${TL.first}\nlast_token_t  = ${TL.tokens[7]}\ntokens out    = ${out}\nadmit_t       = ${TL.qEnd}\ntokenized_t   = ${TL.tok}`),
+        output: () => LIA.kv([
+          ["TTFT", `${TL.first} ms`],
+          ["TPOT", `(${TL.tokens[7]} − ${TL.tokens[0]}) / ${out - 1} = ${fmt.num(tpotMs, 2)} ms`],
+          ["queue time", `${TL.qEnd} − ${TL.tok} = ${fmt.num(queueMs, 1)} ms`],
+          ["E2E", `${TL.done} ms`],
+          ["prompt / completion", `${N} / ${out} tokens`],
+          ["prefix hit", `${prefixHit}/${N} = ${fmt.pct(prefixHit / N, 1)}`],
+          ["peak KV", `⌈${N + out - 1}/16⌉ = 3 blocks (${fmt.bytes((N + out - 1) * M.model.kvBytesPerToken, 2)})`]]),
+        note: `TPOT averages the gaps after the first token: ${out} tokens give ${out - 1} gaps. Mixing TTFT into TPOT is a common dashboard bug.`,
+      },
+      {
+        k: "Histograms", op: "observe() into buckets", where: "Prometheus client",
+        input: () => LIA.kv([["TTFT", `${fmt.num(ttftMs / 1000, 4)} s`], ["TPOT", `${fmt.num(tpotMs / 1000, 5)} s`]]),
+        output: () => h("div", { class: "stage", style: { gap: "6px" } },
+          LIA.viz(histo(ttftB, ttftMs / 1000, "time_to_first_token_seconds")),
+          LIA.viz(histo(tpotB, tpotMs / 1000, "time_per_output_token_seconds"))),
+        note: `${fmt.num(ttftMs / 1000, 4)} s misses the 0.02 bucket by 0.1 ms and lands in le="0.04". Bucket boundaries decide how precise your p99 can ever be.`,
+      },
+      {
+        k: "Counters", op: "inc() on finish", where: "/metrics scrape",
+        input: () => LIA.tokens(M.output, { ids: false, cls: () => "out" }),
+        output: () => LIA.blob([
+          `vllm:prompt_tokens_total{model="70b"}        <span class="hl">+${N}</span>`,
+          `vllm:generation_tokens_total{model="70b"}    <span class="hl">+${out}</span>`,
+          `vllm:prefix_cache_queries_total               <span class="hl">+${N}</span>`,
+          `vllm:prefix_cache_hits_total                  <span class="hl">+${prefixHit}</span>`,
+          `vllm:request_success_total{reason="stop"}     <span class="hl">+1</span>`,
+          `vllm:time_to_first_token_seconds_count        <span class="hl">+1</span>`,
+          `vllm:time_to_first_token_seconds_sum          <span class="hl">+${fmt.num(ttftMs / 1000, 4)}</span>`].join("\n")),
+        note: "Metric names follow vLLM's style. Rates of these counters give tokens/s and prefix hit rate fleet-wide.",
+      },
+      {
+        k: "PromQL p50 / p99", op: "histogram_quantile()", where: "dashboard · 5 m window",
+        input: () => LIA.matrix([after], { rows: ["cum. count"], cols: ttftB.map((b) => (b < 0.1 ? b * 1000 + "ms" : b + "s")), fmt: (v) => fmt.num(v), color: "var(--accent)" }),
+        output: () => h("div", { class: "stage", style: { gap: "6px" } },
+          LIA.blob(`histogram_quantile(0.99,\n  sum by (le) (rate(\n    vllm:time_to_first_token_seconds_bucket[5m])))`),
+          LIA.kv([["p50 TTFT", `${fmt.num(q50 * 1000, 1)} ms`], ["p99 TTFT", `${fmt.num(q99 * 1000, 1)} ms`], ["this request", `${ttftMs} ms → ~p${Math.round((after[3] + (after[4] - after[3]) * ((ttftMs / 1000 - 0.02) / 0.02)) / after[after.length - 1] * 100)}`]])),
+        note: `Window counts are mocked. Prometheus interpolates linearly inside a bucket, so p99 = ${fmt.num(q99 * 1000, 1)} ms is an estimate bounded by bucket edges.`,
+      },
+      {
+        k: "Alert rule", op: "p99 TTFT > 500 ms for 5 m", where: "Alertmanager",
+        input: () => LIA.kv([["p99 TTFT", `${fmt.num(q99 * 1000, 1)} ms`], ["threshold", "500 ms"]]),
+        output: () => h("div", { class: "row" }, LIA.pill("TTFT p99 · OK", "good"), LIA.pill("queue depth · OK", "good"), LIA.pill(`prefix hit ${fmt.pct(prefixHit / N, 0)} · watch`, "warn")),
+        note: "This request is healthy and sits mid-pack. The same pipeline flags it instantly when queueing pushes the tail past the SLO.",
+      },
+    ];
+  };
+
+  LIA.topics.q17.trace = (M) => {
+    const NODE = 989e12 * 8 * 0.55; // 8×H100, 55% MFU
+    const P = M.model.params, L = M.model.L, d = M.model.dModel;
+    const flops = (n, ctx = 0) => 2 * P * n + 2 * L * d * n * (n + 2 * ctx) ; // linear + causal attention over (ctx + n)
+    const bigN = 32768;
+    const tBig = flops(bigN) / NODE * 1000;
+    const head = 3; // the big prompt started prefill 3 ms before our request arrived (mocked)
+    const ourN = M.prompt.length;
+    const tOurPrefill = Math.max((P * 2) / (3.35e12 * 8) * 1000, flops(ourN) / NODE * 1000);
+    const tpotIdle = 24.2; // mocked decode step with its usual batch
+    const waitUn = tBig - head;
+    const ttftUn = waitUn + tOurPrefill;
+    const e2eUn = ttftUn + 7 * tpotIdle;
+    const chunk = 2048, nChunks = bigN / chunk;
+    // a chunked step: 2048 new tokens attending to the chunks before them (average context = half the prompt)
+    const tStep = flops(chunk, bigN / 2) / NODE * 1000;
+    const ttftCh = tStep / 2 + tStep; // wait for the step in flight (avg half), then ride the next one
+    const stepsLeft = nChunks - Math.round(head / tStep) - 2;
+    const e2eCh = ttftCh + Math.min(7, stepsLeft) * tStep + Math.max(0, 7 - stepsLeft) * tpotIdle;
+    const W = 340;
+    const stack = (rows, max) => LIA.hbar({ width: W, labelW: 92, valW: 78, rowH: 28, max, rows, fmt: (v) => fmt.ms(v) });
+    const popR = LIA.rng(17);
+    const pop = Array.from({ length: 999 }, () => 120 + 140 * -Math.log(1 - popR() * 0.995) / 3).concat([e2eUn]).sort((a, b) => a - b);
+    const pct = (q) => pop[Math.min(pop.length - 1, Math.floor(q * pop.length))];
+    const rank = pop.indexOf(e2eUn) / pop.length;
+    return [
+      {
+        k: "Arrival", op: "join scheduler queue", where: "t = 0 · same replica",
+        input: () => LIA.tokens(M.prompt.slice(16, 23), { ids: false, cls: () => "hl" }),
+        output: () => LIA.matrix([[bigN, -head], [ourN, 0]], { rows: ["doc-summarize (mock)", "ours · " + M.id], cols: ["prompt tok", "arrived (ms)"], fmt: (v) => fmt.num(v), strength: 0 }),
+        note: `A mocked 32K-token document prompt began prefill ${head} ms before ours. Without chunking the engine runs it as one indivisible step.`,
+      },
+      {
+        k: "Head-of-line block", op: "wait for 32K prefill", where: "FLOPs ÷ (8×H100 × 55% MFU)",
+        input: () => LIA.blob(`FLOPs = 2·P·N + 2·L·d·N²\n      = 2·70.6e9·32768 + 2·80·8192·32768²\n      = ${fmt.si(flops(bigN), 2)}\ntime  = ${fmt.si(flops(bigN), 2)} / ${fmt.si(NODE, 2)}/s`),
+        output: () => LIA.kv([["32K prefill", fmt.ms(tBig)], ["our wait", `${fmt.ms(tBig)} − ${head} ms = ${fmt.ms(waitUn)}`], ["our own prefill", `${fmt.num(tOurPrefill, 2)} ms`]]),
+        note: `Our own work is ${fmt.num(tOurPrefill, 1)} ms, but it cannot start until the giant step ends. Every running decoder stalls for the same ${fmt.ms(tBig)}.`,
+      },
+      {
+        k: "Latency breakdown", op: "decompose E2E", where: "unchunked",
+        input: () => LIA.kv([["TTFT", fmt.ms(ttftUn)], ["decode", `7 × ${tpotIdle} ms`]]),
+        output: () => stack([{ label: "unchunked", segs: [{ value: waitUn, color: "var(--bad)", label: "queue" }, { value: tOurPrefill, color: "var(--compute)", label: "prefill" }, { value: 7 * tpotIdle, color: "var(--hbm)", label: "decode" }] }], e2eUn * 1.05),
+        note: `${fmt.pct(waitUn / e2eUn, 0)} of this request's ${fmt.ms(e2eUn)} is pure waiting. Red = queue, violet = prefill, amber = decode.`,
+      },
+      {
+        k: "Where it lands", op: "rank among 1,000 requests", where: "mocked population",
+        input: () => LIA.kv([["this E2E", fmt.ms(e2eUn)], ["typical", `p50 ${fmt.ms(pct(0.5))}`]]),
+        output: () => {
+          const sv = LIA.svg(W, 90, { "aria-label": "Latency distribution" });
+          const max = Math.max(...pop) * 1.05, bins = 34, cnt = new Array(bins).fill(0);
+          pop.forEach((v) => cnt[Math.min(bins - 1, Math.floor((v / max) * bins))]++);
+          const cm = Math.max(...cnt);
+          cnt.forEach((c, i) => sv.appendChild(s("rect", { x: 6 + i * ((W - 12) / bins), y: 66 - (c / cm) * 54, width: (W - 12) / bins - 1, height: (c / cm) * 54 + 0.5, fill: "var(--accent)", opacity: 0.6 })));
+          const xo = 6 + (e2eUn / max) * (W - 12);
+          sv.appendChild(s("line", { x1: xo, x2: xo, y1: 8, y2: 66, stroke: "var(--bad)", "stroke-width": 2 }));
+          sv.appendChild(s("text", { x: xo - 4, y: 18, "text-anchor": "end", "font-size": 10.5, fill: "var(--bad)" }, `ours · p${fmt.num(rank * 100, 1)}`));
+          sv.appendChild(s("text", { x: 6, y: 84, "font-size": 10, fill: "var(--muted)" }, `p50 ${fmt.ms(pct(0.5))} · p99 ${fmt.ms(pct(0.99))} · max ${fmt.ms(pop[pop.length - 1])}`));
+          return sv;
+        },
+        note: "A tiny, easy request becomes the tail sample. Tail latency is usually about what a request waited behind, not about the request itself.",
+      },
+      {
+        k: "Chunked prefill", op: `split 32K into ${nChunks} × ${chunk}`, where: "token budget per step",
+        input: () => LIA.tokens([{ t: "32K doc", id: bigN }, ...M.prompt.slice(16, 23)], { ids: false, cls: (t, i) => (i ? "hl" : "out") }),
+        output: () => LIA.matrix([[chunk, 0, 47], [chunk, ourN, 47], [chunk, 0, 48], [chunk, 0, 48]], {
+          rows: ["step k", "step k+1", "step k+2", "step k+3"], cols: ["doc chunk", "our prefill", "decodes"], fmt: (v) => fmt.num(v), color: "var(--compute)", highlight: (i, j) => i === 1 && j === 1 }),
+        note: `Each step now costs ≈ ${fmt.num(tStep, 1)} ms. Our ${ourN}-token prefill rides in the very next step next to a doc chunk and ~47 decodes (mocked batch).`,
+      },
+      {
+        k: "After", op: "re-decompose E2E", where: "chunked · budget 2,048",
+        input: () => LIA.kv([["TTFT", `½·${fmt.num(tStep, 1)} + ${fmt.num(tStep, 1)} = ${fmt.num(ttftCh, 1)} ms`], ["decode", `7 steps ≈ ${fmt.num(tStep, 1)} ms while doc prefill runs`]]),
+        output: () => stack([
+          { label: "unchunked", segs: [{ value: waitUn, color: "var(--bad)" }, { value: tOurPrefill, color: "var(--compute)" }, { value: 7 * tpotIdle, color: "var(--hbm)" }] },
+          { label: "chunked", segs: [{ value: ttftCh, color: "var(--compute)" }, { value: e2eCh - ttftCh, color: "var(--hbm)" }] }], e2eUn * 1.05),
+        note: `TTFT drops ${fmt.num(ttftUn / ttftCh, 0)}× (${fmt.ms(ttftUn)} → ${fmt.num(ttftCh, 0)} ms) and E2E ${fmt.ms(e2eUn)} → ${fmt.ms(e2eCh)}. The price: TPOT rises to ~${fmt.num(tStep, 0)} ms while the doc is still prefilling.`,
+      },
+    ];
+  };
+
+  LIA.topics.q18.trace = (M) => {
+    const lambda = 4; // req/s
+    const r = LIA.rng(1808);
+    const arr = [];
+    let t = 0;
+    for (let i = 0; i < 60; i++) { t += LIA.expSample(lambda, r); arr.push(t); }
+    const ours = 37;
+    // mocked per-request results for a 200-request run; ours is index `ours`
+    const rr = LIA.rng(99);
+    const samples = Array.from({ length: 200 }, (_, i) => {
+      const ttft = 18 + 60 * -Math.log(1 - rr() * 0.999) * (rr() < 0.04 ? 6 : 0.5);
+      const tpot = 21 + rr() * 9 + (rr() < 0.03 ? 40 : 0);
+      return { i, ttft, tpot, out: 8 + Math.floor(rr() * 120) };
+    });
+    const net = 3.3; // mocked client ↔ server network + SSE parse
+    samples[ours] = { i: ours, ttft: ttftMs + net, tpot: tpotMs, out: M.output.length };
+    const sortedT = samples.map((x) => x.ttft).sort((a, b) => a - b);
+    const sortedP = samples.map((x) => x.tpot).sort((a, b) => a - b);
+    const q = (arr2, p) => arr2[Math.min(arr2.length - 1, Math.ceil(p * arr2.length) - 1)];
+    const SLO = { ttft: 200, tpot: 50 };
+    const ok = samples.filter((x) => x.ttft <= SLO.ttft && x.tpot <= SLO.tpot).length;
+    const dur = 200 / lambda + 6; // mocked run length incl. drain
+    const outTok = samples.reduce((a, x) => a + x.out, 0);
+    const itl = TL.tokens.slice(1).map((v, i) => +(v - TL.tokens[i]).toFixed(1));
+    const rankT = sortedT.indexOf(samples[ours].ttft) / sortedT.length;
+    return [
+      {
+        k: "Arrival time", op: `Poisson λ = ${lambda}/s`, where: "load generator",
+        input: () => LIA.kv([["seed", "1808"], ["gap ~", `Exp(λ) · mean ${1000 / lambda} ms`], ["sample #", String(ours)]]),
+        output: () => {
+          const W = 340, sv = LIA.svg(W, 66, { "aria-label": "Arrival times" });
+          const max = arr[arr.length - 1];
+          arr.forEach((v, i) => sv.appendChild(s("line", { x1: 6 + (v / max) * (W - 12), x2: 6 + (v / max) * (W - 12), y1: i === ours ? 8 : 22, y2: 44, stroke: i === ours ? "var(--accent)" : "var(--muted)", "stroke-width": i === ours ? 3 : 1 })));
+          sv.appendChild(s("text", { x: 6, y: 60, "font-size": 10.5, fill: "var(--muted)" }, `60 arrivals over ${fmt.num(max, 1)} s · ours at t = ${fmt.num(arr[ours], 3)} s`));
+          return sv;
+        },
+        note: `Gaps are exponential, so arrivals clump: the gap right before ours is ${fmt.num((arr[ours] - arr[ours - 1]) * 1000, 0)} ms against a ${1000 / lambda} ms mean. Uniform spacing would hide those bursts.`,
+      },
+      {
+        k: "Send", op: "POST /v1/chat/completions", where: "client · stream=true",
+        input: () => LIA.tokens(M.prompt, { ids: false, max: 28, cls: (t, i) => (i >= 16 && i < 23 ? "hl" : "") }),
+        output: () => LIA.blob(LIA.esc(JSON.stringify(Object.assign({}, M.request, { ignore_eos: false }), null, 1))),
+        note: `Prompt = ${M.prompt.length} tokens after templating. Real benchmarks often set ignore_eos or fixed max_tokens so every engine generates the same length; here the model stops after ${M.output.length}.`,
+      },
+      {
+        k: "Measure", op: "timestamp each SSE chunk", where: "client clock",
+        input: () => LIA.tokens(M.output, { ids: false, sub: (tk, i) => `${fmt.num(TL.tokens[i] + net, 1)}`, cls: () => "out" }),
+        output: () => LIA.kv([
+          ["TTFT", `${ttftMs} + ${net} net = ${fmt.num(ttftMs + net, 1)} ms`],
+          ["ITLs", itl.join(", ") + " ms"],
+          ["TPOT", `mean ITL = ${fmt.num(tpotMs, 2)} ms`],
+          ["E2E", `${fmt.num(e2eMs + net, 1)} ms`]]),
+        note: "Client-side TTFT includes the network, so it is a bit higher than the server metric in Q16. Benchmark from where your users are.",
+      },
+      {
+        k: "Record row", op: "append to results", where: "results.jsonl",
+        input: () => LIA.kv([["request", M.id], ["output tok", String(M.output.length)]]),
+        output: () => LIA.matrix([ours - 2, ours - 1, ours, ours + 1, ours + 2].map((i) => [samples[i].ttft, samples[i].tpot, samples[i].out]), {
+          rows: [ours - 2, ours - 1, ours, ours + 1, ours + 2].map((i) => `#${i}${i === ours ? " ◀" : ""}`), cols: ["TTFT ms", "TPOT ms", "out tok"], d: 1, color: "var(--accent)", highlight: (i) => i === 2 }),
+        note: "Neighbouring rows are mocked. Keep raw per-request rows, not only averages, so you can recompute any percentile later.",
+      },
+      {
+        k: "Aggregate", op: "sort → percentiles", where: "200 requests",
+        input: () => LIA.caption(`200 TTFT values, sorted. Ours (${fmt.num(samples[ours].ttft, 1)} ms) sits at rank ${sortedT.indexOf(samples[ours].ttft) + 1}.`),
+        output: () => {
+          const W = 340, sv = LIA.svg(W, 76, { "aria-label": "Sorted TTFTs" });
+          const max = sortedT[sortedT.length - 1];
+          sortedT.forEach((v, i) => sv.appendChild(s("rect", { x: 6 + i * ((W - 12) / 200), y: 54 - (v / max) * 46, width: 1.3, height: (v / max) * 46 + 0.5, fill: v === samples[ours].ttft ? "var(--accent)" : "var(--muted)", opacity: v === samples[ours].ttft ? 1 : 0.5 })));
+          const xo = 6 + sortedT.indexOf(samples[ours].ttft) * ((W - 12) / 200);
+          sv.appendChild(s("path", { d: `M${xo - 5},6 L${xo + 5},6 L${xo},14 Z`, fill: "var(--accent)" }));
+          sv.appendChild(s("line", { x1: xo, x2: xo, y1: 14, y2: 54, stroke: "var(--accent)", "stroke-width": 1.5, "stroke-dasharray": "3 2" }));
+          sv.appendChild(s("text", { x: xo + 8, y: 14, "font-size": 10.5, fill: "var(--accent)" }, `ours · ${fmt.num(samples[ours].ttft, 1)} ms`));
+          sv.appendChild(s("text", { x: 6, y: 70, "font-size": 10.5, fill: "var(--ink)" }, `p50 ${fmt.num(q(sortedT, 0.5), 1)} · p99 ${fmt.num(q(sortedT, 0.99), 1)} ms · TPOT p99 ${fmt.num(q(sortedP, 0.99), 1)} ms`));
+          return sv;
+        },
+        note: `Ours is at about p${fmt.num(rankT * 100, 0)}. With 200 samples, p99 rests on just 2 requests: run longer before trusting tail numbers.`,
+      },
+      {
+        k: "Goodput", op: `SLO: TTFT ≤ ${SLO.ttft} ms & TPOT ≤ ${SLO.tpot} ms`, where: "per request, then ÷ duration",
+        input: () => LIA.kv([["ours", `${fmt.num(samples[ours].ttft, 1)} ms / ${fmt.num(samples[ours].tpot, 1)} ms ✓`], ["run length", `${fmt.num(dur, 0)} s (mocked)`]]),
+        output: () => LIA.kv([
+          ["throughput", `200 / ${fmt.num(dur, 0)} s = ${fmt.num(200 / dur, 2)} req/s`],
+          ["goodput", `${ok} / ${fmt.num(dur, 0)} s = ${fmt.num(ok / dur, 2)} req/s`],
+          ["output tok/s", `${fmt.num(outTok)} / ${fmt.num(dur, 0)} = ${fmt.num(outTok / dur, 0)}`],
+          ["SLO pass", `${ok}/200 = ${fmt.pct(ok / 200, 1)}`]]),
+        note: "Goodput counts only requests that met both SLOs. Compare engines on goodput at your SLO, not on raw tokens/s.",
+      },
+    ];
+  };
 })();

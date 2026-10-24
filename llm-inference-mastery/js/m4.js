@@ -458,4 +458,205 @@
         explain: "EP is synchronous per layer. Load imbalance turns directly into idle GPUs and longer steps, which is why routers use load-balancing losses and engines use redundant hot experts." },
     ],
   });
+  /* =====================================================================
+   * Worked examples: the shared mocked request (LIA.MOCK) through Q22 / Q23
+   * ===================================================================== */
+  const BS = 16; // KV block size in tokens (vLLM default)
+  /** small strip of KV blocks: fills = tokens used per block */
+  function blockStrip(ids, fills, opt = {}) {
+    const W = 360, bw = 100, H = 74;
+    const sv = LIA.svg(W, H, { "aria-label": "KV blocks" });
+    ids.forEach((id, i) => {
+      const x = 6 + i * (bw + 16);
+      sv.appendChild(s("rect", { x, y: 18, width: bw, height: 30, rx: 5, fill: "var(--surface)", stroke: opt.color || "var(--hbm)" }));
+      for (let k = 0; k < BS; k++) {
+        const used = k < fills[i];
+        const isNew = opt.newSlot && opt.newSlot[0] === i && opt.newSlot[1] === k;
+        sv.appendChild(s("rect", { x: x + 3 + k * 5.9, y: 22, width: 4.6, height: 22, rx: 1, fill: isNew ? "var(--accent)" : used ? (opt.color || "var(--hbm)") : "var(--surface-2)", opacity: used || isNew ? 0.85 : 1 }));
+      }
+      sv.appendChild(s("text", { x: x + bw / 2, y: 13, "text-anchor": "middle", "font-size": 11, "font-weight": 600, fill: "var(--ink)" }, `#${id}`));
+      sv.appendChild(s("text", { x: x + bw / 2, y: 64, "text-anchor": "middle", "font-size": 10.5, fill: "var(--muted)" }, `${fills[i]}/${BS} tokens`));
+    });
+    return sv;
+  }
+
+  LIA.topics.q22.trace = (M) => {
+    const N = M.prompt.length; // 28
+    const kvTok = M.model.kvBytesPerToken; // 327,680
+    const kvPerLayerTok = kvTok / M.model.L; // 4,096 B
+    const kvBytes = N * kvTok; // 9,175,040
+    const nBlocks = Math.ceil(N / BS);
+    const fills = Array.from({ length: nBlocks }, (_, i) => Math.min(BS, N - i * BS));
+    const NODE_BW = 3.35e12 * 8, NODE_FLOPS = 989e12 * 8;
+    const tWeights = (M.model.params * 2) / NODE_BW * 1000; // ms
+    const tCompute = (2 * M.model.params * N) / NODE_FLOPS * 1000;
+    const tPrefill = Math.max(tWeights, tCompute);
+    const rdma = 50e9; // 400 Gb/s NIC
+    const tXfer = kvBytes / rdma * 1000;
+    const perLayer = N * kvPerLayerTok;
+    const tcp = 5e9; // mocked: CPU-staged copy over TCP
+    // decode: prompt + each fed output token (the final <|eot_id|> is sampled, never fed back)
+    const fed = M.output.slice(0, -1);
+    const total = N + fed.length; // 35
+    const decBlocks = [3051, 18, 2207];
+    return [
+      {
+        k: "Route", op: "pick P & D workers", where: "router · CPU",
+        input: () => LIA.blob(LIA.esc(JSON.stringify(M.request, null, 1)).slice(0, 420) + "…"),
+        output: () => h("div", { class: "stage", style: { gap: "8px" } },
+          LIA.matrix([[4096, 0.71], [512, 0.42], [9216, 0.88]], { rows: ["prefill-0", "prefill-1 ✓", "prefill-2"], cols: ["queued tok", "load"], fmt: (v) => (v < 1 ? fmt.pct(v) : fmt.num(v)), color: "var(--compute)" }),
+          LIA.matrix([[0.81], [0.34], [0.66]], { rows: ["decode-3", "decode-5 ✓", "decode-7"], cols: ["KV used"], fmt: (v) => fmt.pct(v), color: "var(--hbm)" }),
+          LIA.caption("Mocked pool state. Prefill goes to the shortest token queue, decode to the most free KV blocks.")),
+        note: `The router sees only ${N} prompt tokens after tokenizing. It picks <b>prefill-1</b> (least queued work) and reserves a slot on <b>decode-5</b> (most free KV memory).`,
+      },
+      {
+        k: "Prefill", op: `forward pass · ${N} tokens × 80 layers`, where: "prefill-1 · 8×H100",
+        input: () => LIA.tokens(M.prompt, { ids: false, cls: (t, i) => (i >= 16 && i < 23 ? "hl" : "") }),
+        output: () => h("div", { class: "stage", style: { gap: "8px" } },
+          LIA.kv([["K,V shape", `[80 L × 2 × 8 kv-heads × ${N} tok × 128] FP16`], ["KV bytes", `${N} × ${fmt.num(kvTok)} B = ${fmt.num(kvBytes)} B (${fmt.bytes(kvBytes, 2)})`], ["first token", LIA.tokens([M.output[0]])]]),
+          LIA.hbar({ width: 340, labelW: 110, valW: 70, rowH: 26, rows: [{ label: "weight reads", value: tWeights, color: "var(--hbm)" }, { label: "FLOPs", value: tCompute, color: "var(--compute)" }], fmt: (v) => fmt.num(v, 2) + " ms" })),
+        note: `Prefill writes K and V for all ${N} positions and samples token 1 (“${M.output[0].t}”). At only ${N} tokens even prefill is weight-read bound: ${fmt.num(tWeights, 2)} ms vs ${fmt.num(tCompute, 2)} ms of math.`,
+      },
+      {
+        k: "Pack blocks", op: `paginate · ${BS} tok/block`, where: "prefill-1 HBM",
+        input: () => LIA.tokens(M.prompt, { ids: false, sub: (t, i) => `b${Math.floor(i / BS)}`, cls: (t, i) => (Math.floor(i / BS) ? "out" : "hl") }),
+        output: () => h("div", { class: "stage", style: { gap: "8px" } }, LIA.viz(blockStrip([412, 97], fills)),
+          LIA.matrix([[0, 412, fills[0]], [1, 97, fills[1]]], { cols: ["logical", "physical", "used"], fmt: (v) => String(v), color: "var(--hbm)", strength: 0 })),
+        note: `${N} tokens need ⌈${N}/${BS}⌉ = ${nBlocks} blocks: one full block and one with ${fills[1]}/${BS} slots used. Each full block holds ${BS} × ${fmt.num(kvTok)} B = ${fmt.bytes(BS * kvTok, 2)} across all 80 layers.`,
+      },
+      {
+        k: "RDMA transfer", op: "GPUDirect RDMA write", where: "InfiniBand / RoCE · 400 Gb/s",
+        input: () => LIA.viz(blockStrip([412, 97], fills)),
+        output: () => h("div", { class: "stage", style: { gap: "8px" } },
+          LIA.hbar({ width: 340, labelW: 120, valW: 80, rowH: 26, rows: [
+            { label: "RDMA 50 GB/s", value: tXfer, color: "var(--sram)" },
+            { label: "TCP via CPU (mock)", value: kvBytes / tcp * 1000, color: "var(--bad)" },
+            { label: "prefill itself", value: tPrefill, color: "var(--compute)" }], fmt: (v) => fmt.num(v, 3) + " ms" }),
+          LIA.kv([["per layer", `${N} × ${fmt.num(kvPerLayerTok)} B = ${fmt.num(perLayer)} B`], ["layers", "80 transfers, overlapped with compute"], ["total", `${fmt.bytes(kvBytes, 2)} ÷ 50 GB/s = ${fmt.num(tXfer * 1000, 0)} µs`]])),
+        note: `Layer-wise streaming starts sending layer 0's KV while layer 1 is still computing, so almost none of the ${fmt.num(tXfer * 1000, 0)} µs adds to latency. A 32K-token prompt would move ${fmt.bytes(32768 * kvTok, 1)} instead.`,
+      },
+      {
+        k: "Remap on decode", op: "allocate + rewrite block table", where: "decode-5",
+        input: () => LIA.matrix([[0, 412], [1, 97]], { cols: ["logical", "prefill phys."], fmt: (v) => String(v), strength: 0 }),
+        output: () => h("div", { class: "stage", style: { gap: "8px" } },
+          LIA.matrix([[0, decBlocks[0], fills[0]], [1, decBlocks[1], fills[1]]], { cols: ["logical", "decode phys.", "used"], fmt: (v) => String(v), strength: 0 }),
+          LIA.viz(blockStrip(decBlocks.slice(0, 2), fills, { color: "var(--sram)" }))),
+        note: "Physical block IDs are local to each GPU, so the decode worker allocates its own blocks and rewrites the table. Logical order (what attention reads) never changes.",
+      },
+      {
+        k: "Decode loop", op: "1 token / step", where: "decode-5 · batched with other requests",
+        input: () => LIA.tokens([M.output[0]], { cls: () => "out" }),
+        output: () => LIA.matrix(fed.map((t, i) => [i + 1, N + i + 1]), {
+          rows: fed.map((t, i) => `${LIA.showTok(t.t).padEnd(9)}→ ${LIA.showTok(M.output[i + 1].t)}`),
+          cols: ["step", "KV len"], fmt: (v) => String(v), color: "var(--hbm)", max: total * 3 }),
+        note: `Each step feeds the previous token, appends its K,V (${fmt.num(kvTok)} B) and samples the next one. After “.” the model emits &lt;|eot_id|&gt;; the KV now holds ${total} tokens.`,
+      },
+      {
+        k: "Finish + free", op: "stop on EOS · release blocks", where: "decode-5",
+        input: () => LIA.viz(blockStrip(decBlocks, [16, 16, total - 32], { color: "var(--sram)", newSlot: [2, total - 33] })),
+        output: () => h("div", { class: "stage", style: { gap: "8px" } }, LIA.tokens(M.output, { ids: false, cls: () => "out" }),
+          LIA.kv([["KV freed", `3 blocks · ${fmt.bytes(total * kvTok, 2)} used of ${fmt.bytes(3 * BS * kvTok, 2)}`], ["TTFT path", `queue + prefill ${fmt.num(tPrefill, 2)} ms (token 1 streamed from prefill-1)`], ["TPOT path", "decode-5 only, never stalled by other prompts"]])),
+        note: `${total} tokens span ⌈${total}/${BS}⌉ = 3 blocks. Prefill and decode never shared a GPU, so this request's TPOT is immune to other users' long prompts.`,
+      },
+    ];
+  };
+
+  LIA.topics.q23.trace = (M) => {
+    const paris = M.output[5]; // " Paris"
+    const rm = (seed, r, c, sc) => { const g = LIA.rng(seed); return Array.from({ length: r }, () => Array.from({ length: c }, () => +((g() * 2 - 1) * sc).toFixed(2))); };
+    const r2 = (v) => +v.toFixed(2);
+    const x = LIA.toy.embed([paris])[0];
+    const W1 = rm(201, 8, 8, 0.7), W2 = rm(202, 8, 8, 0.7);
+    const cols = (A, a, b) => A.map((row) => row.slice(a, b));
+    const mm = LIA.toy.matmul;
+    const h0 = mm([x], cols(W1, 0, 4))[0].map(r2), h1 = mm([x], cols(W1, 4, 8))[0].map(r2);
+    const relu = (v) => v.map((z) => Math.max(0, z));
+    const a0 = relu(h0), a1 = relu(h1);
+    const p0 = mm([a0], W2.slice(0, 4))[0].map(r2), p1 = mm([a1], W2.slice(4, 8))[0].map(r2);
+    const y = p0.map((v, i) => r2(v + p1[i]));
+    const full = mm([relu(mm([x], W1)[0])], W2)[0].map(r2);
+    const Wg = rm(203, 8, 8, 0.9);
+    const gate = mm([y], Wg)[0].map(r2);
+    const order = gate.map((v, i) => [v, i]).sort((a, b) => b[0] - a[0]);
+    const [ea, eb] = [order[0][1], order[1][1]];
+    const wts = LIA.toy.softmax([gate[ea], gate[eb]]);
+    const E = (e) => mm([y], rm(300 + e, 8, 8, 0.5))[0].map(r2);
+    const ya = E(ea), yb = E(eb);
+    const comb = ya.map((v, i) => r2(wts[0] * v + wts[1] * yb[i]));
+    const dl = ["d0", "d1", "d2", "d3", "d4", "d5", "d6", "d7"];
+    const hidden = 4096; // Mixtral-like hidden size used in the lab
+    return [
+      {
+        k: "Hidden vector", op: "embed · toy d=8", where: "token at position 33",
+        input: () => LIA.tokens([paris], { cls: () => "out" }),
+        output: () => LIA.matrix([x], { rows: ["x"], cols: dl, diverge: true }),
+        note: `The real model carries a ${fmt.num(hidden)}-dim vector (${fmt.num(hidden * 2)} B in BF16). We follow an 8-dim toy version so every number fits on screen.`,
+      },
+      {
+        k: "TP: column split", op: "x · W₁[:, shard]", where: "GPU0 | GPU1 · no comm",
+        input: () => h("div", { class: "stage", style: { gap: "6px" } }, LIA.matrix([x], { rows: ["x (both)"], diverge: true }), LIA.caption("W₁ is 8×8: GPU0 holds columns 0–3, GPU1 columns 4–7.")),
+        output: () => h("div", { class: "stage", style: { gap: "6px" } }, LIA.matrix([h0], { rows: ["GPU0"], cols: ["h0", "h1", "h2", "h3"], diverge: true }), LIA.matrix([h1], { rows: ["GPU1"], cols: ["h4", "h5", "h6", "h7"], diverge: true })),
+        note: "Each GPU computes half of the hidden activations from the full input. No communication yet, and each GPU stores only half of W₁.",
+      },
+      {
+        k: "TP: row split", op: "act(h) · W₂[shard, :]", where: "GPU0 | GPU1 · partial sums",
+        input: () => h("div", { class: "stage", style: { gap: "6px" } }, LIA.matrix([a0], { rows: ["GPU0 relu"], diverge: true }), LIA.matrix([a1], { rows: ["GPU1 relu"], diverge: true })),
+        output: () => LIA.matrix([p0, p1], { rows: ["partial₀", "partial₁"], cols: dl, diverge: true }),
+        note: "W₂ is split by rows to match, so each GPU produces a full-width but partial output. (Toy uses ReLU; Llama/Mixtral use SwiGLU.)",
+      },
+      {
+        k: "All-reduce", op: "Σ partials (NVLink ring)", where: "2 GPUs · inside the node",
+        input: () => LIA.matrix([p0, p1], { rows: ["partial₀", "partial₁"], diverge: true }),
+        output: () => h("div", { class: "stage", style: { gap: "6px" } }, LIA.matrix([y, full], { rows: ["all-reduced", "unsharded ✓"], cols: dl, diverge: true }),
+          LIA.kv([["real payload", `${fmt.num(hidden * 2)} B per token`], ["ring, n=8", `each GPU sends 2·(n−1)/n × ${fmt.num(hidden * 2)} = ${fmt.num(2 * 7 / 8 * hidden * 2)} B`]])),
+        note: "The sum matches the single-GPU result exactly (up to rounding). This all-reduce happens twice per layer, which is why TP stays on NVLink.",
+      },
+      {
+        k: "PP hand-off", op: "send hidden to next stage", where: "node A → node B · once",
+        input: () => LIA.matrix([y], { rows: ["layer 15 out"], diverge: true }),
+        output: () => {
+          const sv = LIA.svg(340, 90, { "aria-label": "Pipeline hand-off" });
+          [["stage 0 · L0–15", 6, "var(--accent)"], ["stage 1 · L16–31", 196, "var(--compute)"]].forEach(([t, xx, c]) => {
+            sv.appendChild(s("rect", { x: xx, y: 20, width: 138, height: 40, rx: 6, fill: c, opacity: 0.18, stroke: c }));
+            sv.appendChild(s("text", { x: xx + 69, y: 45, "text-anchor": "middle", "font-size": 11, fill: "var(--ink)" }, t));
+          });
+          sv.appendChild(s("path", { d: "M146,40 H192", stroke: "var(--hbm)", "stroke-width": 3 }));
+          sv.appendChild(s("text", { x: 170, y: 78, "text-anchor": "middle", "font-size": 10.5, fill: "var(--hbm)" }, `${fmt.num(hidden * 2)} B / token over IB`));
+          return sv;
+        },
+        note: "Pipeline parallelism moves only this one vector per stage boundary, so it tolerates the slower inter-node network. The cost is bubbles, not bandwidth.",
+      },
+      {
+        k: "MoE router", op: "gate = y · W_g → top-2", where: "every MoE layer",
+        input: () => LIA.matrix([y], { rows: ["y"], diverge: true }),
+        output: () => h("div", { class: "stage", style: { gap: "6px" } },
+          LIA.matrix([gate], { rows: ["logit"], cols: ["E0", "E1", "E2", "E3", "E4", "E5", "E6", "E7"], diverge: true, highlight: (i, j) => j === ea || j === eb }),
+          LIA.kv([["top-2", `E${ea} (${gate[ea]}), E${eb} (${gate[eb]})`], ["softmax over top-2", `w = ${wts[0].toFixed(3)}, ${wts[1].toFixed(3)}`]])),
+        note: `Gate weights are mocked (seeded). Only E${ea} and E${eb} run for “ Paris”; the other 6 experts do no work for this token.`,
+      },
+      {
+        k: "All-to-all dispatch", op: `send y to GPU${ea} & GPU${eb}`, where: "EP = 8 · one expert per GPU",
+        input: () => {
+          const sv = LIA.svg(340, 84, { "aria-label": "All-to-all" });
+          for (let g = 0; g < 8; g++) {
+            const xx = 8 + g * 41, hit = g === ea || g === eb;
+            sv.appendChild(s("rect", { x: xx, y: 46, width: 34, height: 26, rx: 4, fill: hit ? "var(--compute)" : "var(--surface-2)", stroke: "var(--line)", opacity: hit ? 0.8 : 1 }));
+            sv.appendChild(s("text", { x: xx + 17, y: 63, "text-anchor": "middle", "font-size": 10.5, fill: hit ? "var(--surface)" : "var(--muted)" }, `E${g}`));
+            if (hit) sv.appendChild(s("path", { d: `M170,14 L${xx + 17},44`, stroke: "var(--compute)", "stroke-width": 2 }));
+          }
+          sv.appendChild(s("circle", { cx: 170, cy: 12, r: 7, fill: "var(--accent)" }));
+          return sv;
+        },
+        output: () => LIA.matrix([ya, yb], { rows: [`E${ea}(y)`, `E${eb}(y)`], cols: dl, diverge: true }),
+        note: "The token's vector travels to the two GPUs that own its experts, which run their FFN on it. A second all-to-all brings the results back.",
+      },
+      {
+        k: "Combine", op: `w₁·E${ea} + w₂·E${eb}`, where: "back on the token's GPU",
+        input: () => LIA.matrix([ya, yb], { rows: [`${wts[0].toFixed(2)} × E${ea}`, `${wts[1].toFixed(2)} × E${eb}`], diverge: true }),
+        output: () => h("div", { class: "stage", style: { gap: "6px" } }, LIA.matrix([comb], { rows: ["MoE out"], cols: dl, diverge: true }),
+          LIA.caption("Then residual add and the next layer, repeated for all 32 layers before “ Paris” becomes logits.")),
+        note: "Weighted sum of the two expert outputs. If E" + ea + "'s GPU is overloaded by other tokens, this token, and the whole step, waits for it.",
+      },
+    ];
+  };
 })();
