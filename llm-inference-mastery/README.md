@@ -1,6 +1,8 @@
 # LLM Inference Mastery
 
-An interactive, visualization-first course for the Inference AI Engineer curriculum: 25 interview-grade questions across the LLM serving stack. Every topic is a live lab with sliders, simulations and charts first, short key ideas second, and a graded checkpoint last.
+An interactive, visualization-first course for the Inference AI Engineer curriculum: 25 interview-grade questions across the LLM serving stack. Every topic is a live lab with sliders, simulations and charts first, then a **worked example**, then short key ideas and a graded checkpoint.
+
+The worked example follows one mocked request, *“What is the capital of France?”* → *“The capital of France is Paris.”* (Llama-3-70B, 28 prompt tokens, 8 output tokens), through that topic's mechanism one step at a time. Each step shows the data going in, the operation, and the data coming out: JSON → chat template → token IDs → embeddings → Q/K/V → attention → logits → sampled token → SSE frame in Q1, and the same request's KV blocks, SSE frames, batch slot, draft tokens, quantized weights, kernel timeline, cost and so on in the other topics. Attention numbers come from a tiny deterministic toy model (`LIA.toy`, d_model 8, GQA 2:1) so every value shown is actually computed; values that are invented are labelled as mocked.
 
 ## Run it
 
@@ -48,7 +50,8 @@ css/style.css     design tokens (light + dark) and components
 js/core.js        router, progress store, quiz engine, UI + SVG chart helpers (LIA.*)
 js/m0.js          roadmap
 js/m1.js … m5b.js one file per module; each topic calls LIA.register({...})
+js/m1-trace.js    Module 1 worked examples (other modules keep theirs in the module file)
 bundle.py         inline everything into one HTML file
 ```
 
-To add a topic, call `LIA.register` with `id`, `module`, `title`, a `render(stage)` function, `insights` and `quiz`, then add its id to `LIA.ORDER` in `core.js`. The API is documented at the top of `core.js`.
+To add a topic, call `LIA.register` with `id`, `module`, `title`, a `render(stage)` function, `insights` and `quiz`, then add its id to `LIA.ORDER` in `core.js`. Add an optional `trace(MOCK)` returning steps to get a worked example. The API is documented at the top of `core.js`.

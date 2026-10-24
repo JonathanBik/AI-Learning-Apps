@@ -750,4 +750,282 @@
       { type: "mcq", prompt: "In which situation is speculative decoding most likely to slow you down?", options: ["Batch 1 chat with a well-matched draft", "Very large batches (compute-bound) with low acceptance rate", "Code completion with repetitive text", "Greedy decoding with α = 0.9"], answer: 1, explain: "When the GPU is already compute-bound, verifying k extra positions costs real FLOPs, and low α wastes most of them." },
     ],
   });
+  /* ======================================================================
+   * Worked examples: the shared mocked request (LIA.MOCK) through each mechanism.
+   * Attached after registration so each topic object stays readable above.
+   * ==================================================================== */
+  const tk = (t, id, extra) => Object.assign({ t, id }, extra || {});
+  const esc = (x) => LIA.esc(x);
+  const KVB = () => LIA.MOCK.model.kvBytesPerToken;
+  /** plain HTML table using the matrix styling: rows = [[cell,...]], cells may be {v, cls, bg} */
+  function table(head, rows, caption) {
+    return h("div", { class: "mat-wrap" }, h("table", { class: "mat" },
+      caption ? h("caption", null, caption) : null,
+      h("thead", null, h("tr", null, head.map((c) => h("th", null, c)))),
+      h("tbody", null, rows.map((r) => h("tr", null, r.map((c) => {
+        const o = typeof c === "object" && c !== null && !(c instanceof Node) ? c : { v: c };
+        return h("td", { style: { background: o.bg || null, color: o.color || null, fontWeight: o.bold ? 600 : null, textAlign: o.left ? "left" : null, whiteSpace: "pre" } }, o.v instanceof Node ? o.v : String(o.v));
+      }))))));
+  }
+  const stack = (...kids) => h("div", { style: { display: "flex", flexDirection: "column", gap: "8px", minWidth: 0 } }, kids);
+  const cap = (html) => LIA.caption(html);
+
+  /* ---------- Q2: streaming + cancellation ---------- */
+  LIA.topics.q2.trace = (M) => {
+    const frame = (i, extra) => {
+      const delta = i === 0 ? { role: "assistant", content: M.output[0].t } : { content: M.output[i].t };
+      return `<span class="dim">data:</span> ${esc(JSON.stringify({ id: M.id, choices: [{ index: 0, delta, ...(extra || {}) }] }))}`;
+    };
+    const kvHeld = M.prompt.length + 3; // prompt + outputs 1..3 already fed back; token 4 not yet processed
+    const blocks = Math.ceil(kvHeld / 16);
+    const blockSvg = (freed) => {
+      const sv = LIA.svg(360, 70, { "aria-label": "KV blocks" });
+      for (let b = 0; b < 2; b++) {
+        const x = 10 + b * 150;
+        sv.appendChild(s("rect", { x, y: 10, width: 140, height: 34, rx: 5, fill: freed ? "var(--surface)" : "var(--hbm-soft)", stroke: freed ? "var(--line)" : "var(--hbm)", "stroke-dasharray": freed ? "4 3" : null }));
+        const used = Math.min(16, kvHeld - b * 16);
+        for (let i = 0; i < 16; i++) sv.appendChild(s("rect", { x: x + 4 + i * 8.25, y: 18, width: 6.5, height: 18, rx: 1.5, fill: freed ? "var(--surface-2)" : i < used ? "var(--hbm)" : "var(--surface-2)" }));
+        sv.appendChild(s("text", { x: x + 70, y: 60, "text-anchor": "middle", "font-size": 11, fill: "var(--muted)" }, freed ? `block #${[42, 17][b]} → free list` : `block #${[42, 17][b]} · ${used}/16 tokens`));
+      }
+      return sv;
+    };
+    return [
+      { k: "Client request", op: "POST /v1/chat/completions", where: "browser → API gateway", inLabel: "User types", input: h("div", { class: "trace-note" }, M.user), outLabel: "HTTP body (stream: true)", output: LIA.blob(esc(JSON.stringify(M.request, null, 2))), note: "<code>stream: true</code> asks for Server-Sent Events: one HTTP response that stays open and carries one event per token." },
+      { k: "Template + tokenize", op: "chat template → BPE", where: "API server (CPU)", input: LIA.blob(esc(JSON.stringify(M.request.messages, null, 1))), output: stack(LIA.tokens(M.prompt), cap(`<b>${M.prompt.length} tokens</b>. Violet = special tokens added by the template.`)), note: "The engine never sees JSON, only these 28 integers, tagged with request id <code>" + M.id + "</code>." },
+      { k: "Prefill → token 1", op: "forward(28 tok) + sample", where: "engine (GPU)", input: LIA.tokens(M.prompt, { cls: () => "dim" }), outLabel: "First SSE frame on the wire", output: stack(LIA.tokens(M.output.slice(0, 1), { cls: () => "out" }), LIA.blob(frame(0) + "\n\n")), note: "Headers <code>Content-Type: text/event-stream</code> went out with this first frame; TTFT ends when it reaches the client." },
+      { k: "Stream tokens 2–4", op: "decode × 3", where: "engine → API → client", input: LIA.tokens(M.output, { cls: (t, i) => (i < 1 ? "out" : "dim") }), outLabel: "Frames, one per token", output: stack(LIA.tokens(M.output, { cls: (t, i) => (i < 4 ? "out" : "dim") }), LIA.blob([1, 2, 3].map((i) => frame(i)).join("\n\n"))), note: "Each frame is flushed immediately; the client renders <i>“The capital of France”</i>." },
+      { k: "Client disconnects", op: "tab closed → TCP FIN", where: "client ✕", input: LIA.kv([["delivered", "4 of 8 tokens"], ["HTTP/1.1", "socket closes, next write fails"], ["HTTP/2", "RST_STREAM (CANCEL) on stream 1"]]), outLabel: "API server notices", output: LIA.blob(`<span class="dim"># FastAPI / Starlette</span>\nif await request.is_disconnected():\n    await engine.abort(<span class="hl">"${M.id}"</span>)`), note: "Detection is the easy half. The hard half is forwarding it to the engine, which only knows request ids." },
+      { k: "Abort propagates", op: "engine.abort(id)", where: "scheduler, next iteration", inLabel: "Planned tokens", input: LIA.tokens(M.output, { cls: (t, i) => (i < 4 ? "out" : "hl") }), outLabel: "Actually generated", output: stack(LIA.tokens(M.output, { cls: (t, i) => (i < 4 ? "out" : "bad") }), cap("Struck-through tokens are never computed. Without the abort the engine would decode to <code>&lt;|eot_id|&gt;</code> here, and up to <code>max_tokens</code> = 64 for a longer answer.")), note: "The request leaves the running batch at the next step boundary, so at most one extra token is wasted." },
+      { k: "KV blocks freed", op: "free(block_table)", where: "block manager", input: stack(blockSvg(false), LIA.kv([["KV tokens held", `${M.prompt.length} prompt + 3 output = ${kvHeld}`], ["bytes", `${kvHeld} × ${fmt.num(KVB())} B = ${fmt.bytes(kvHeld * KVB())}`]])), output: stack(blockSvg(true), cap(`${blocks} blocks (16 tokens each) return to the free pool and can be admitted to a waiting request immediately.`)), note: "Token 4 was sampled but never fed back, so its K/V were never written. Only 31 positions occupy cache." },
+    ];
+  };
+
+  /* ---------- Q6: continuous batching ---------- */
+  LIA.topics.q6.trace = (M) => {
+    const reqs = [
+      { n: "A · ours", len: 8, hue: "var(--accent)" },
+      { n: "B (mocked)", len: 3, hue: "var(--compute)" },
+      { n: "C (mocked)", len: 12, hue: "var(--sram)" },
+      { n: "D (mocked)", len: 5, hue: "var(--hbm)" },
+    ];
+    const E = { n: "E (queued)", len: 4, hue: "var(--good)" };
+    const COLS = 16;
+    // slot timelines: arrays of {req, from, to}
+    const plans = {
+      static: [[{ r: reqs[0], s: 1 }, { r: E, s: 13 }], [{ r: reqs[1], s: 1 }], [{ r: reqs[2], s: 1 }], [{ r: reqs[3], s: 1 }]],
+      continuous: [[{ r: reqs[0], s: 1 }], [{ r: reqs[1], s: 1 }, { r: E, s: 4 }], [{ r: reqs[2], s: 1 }], [{ r: reqs[3], s: 1 }]],
+    };
+    function grid(mode, upto) {
+      const cell = 24, lx = 92, W = lx + COLS * cell + 10, H = 26 + 4 * cell + 6;
+      const sv = LIA.svg(W, H, { "aria-label": mode + " batch grid" });
+      for (let c = 0; c < COLS; c++) sv.appendChild(s("text", { x: lx + c * cell + cell / 2 - 1, y: 14, "text-anchor": "middle", "font-size": 9.5, fill: c + 1 === upto ? "var(--accent)" : "var(--muted)" }, c + 1));
+      plans[mode].forEach((slot, si) => {
+        const y = 22 + si * cell;
+        const names = slot.filter((x) => x.s <= Math.max(upto, 1)).map((x) => x.r.n.split(" ")[0]).join(" → ");
+        sv.appendChild(s("text", { x: 4, y: y + 15, "font-size": 10.5, fill: "var(--ink)" }, `slot ${si + 1}: ${names}`));
+        for (let c = 1; c <= COLS; c++) {
+          const x = lx + (c - 1) * cell;
+          let fill = "var(--surface-2)", op = 1, label = null;
+          const seg = slot.find((x2) => c >= x2.s && c < x2.s + x2.r.len);
+          const batchEnd = mode === "static" ? (c <= 12 ? 12 : 16) : null;
+          if (c <= upto) {
+            if (seg) { fill = seg.r.hue; op = 0.85; if (seg.r === reqs[0]) label = c - seg.s; }
+            else if (mode === "static" && c <= batchEnd && !(c > 12 && si > 0)) { fill = "var(--bad)"; op = 0.22; }
+          }
+          sv.appendChild(s("rect", { x: x + 1, y, width: cell - 3, height: cell - 4, rx: 3, fill, opacity: op }));
+          if (label != null) sv.appendChild(s("text", { x: x + cell / 2 - 0.5, y: y + 14, "text-anchor": "middle", "font-size": 8.5, fill: "var(--surface)" }, LIA.showTok(M.output[label].t).replace("␣", "").slice(0, 3)));
+        }
+      });
+      return sv;
+    }
+    const both = (upto) => stack(h("div", { class: "caption" }, "Static (request-level)"), LIA.viz(grid("static", upto)), h("div", { class: "caption" }, "Continuous (iteration-level)"), LIA.viz(grid("continuous", upto)));
+    const ours = (n) => LIA.tokens(M.output, { cls: (t, i) => (i < n ? "out" : "dim") });
+    return [
+      { k: "The queue", op: "admit 4 slots", where: "scheduler, t = 0", inLabel: "Waiting requests (output lengths mocked)", input: table(["request", "output tokens"], [...reqs, E].map((r) => [{ v: r.n, left: true }, r.len])), outLabel: "Batch of 4 slots", output: both(0), note: "Our request A will emit 8 tokens. E arrives a moment too late for the first batch." },
+      { k: "Steps 1–3", op: "decode × 3", where: "every slot emits 1 token/step", input: both(0), output: stack(both(3), ours(3)), note: "All four slots are busy. B emits its 3rd and final token at step 3." },
+      { k: "Step 4: B is done", op: "refill or pad?", where: "the key decision", input: both(3), output: both(4), note: "Static batching keeps B's slot as padding (red) until the whole batch ends. Continuous batching admits E into the freed slot at the very next step." },
+      { k: "Step 8: A finishes", op: "emit <|eot_id|>", where: "our request completes", input: both(7), output: stack(both(8), ours(8)), note: "Same 8 steps in both modes for A. Its slot now idles (static) or is free for the next arrival (continuous)." },
+      { k: "Steps 9–16", op: "drain", where: "C is the long pole", input: both(8), output: both(16), note: "Static must finish C (12 tokens) before E can even start, so E runs alone in steps 13–16 with 3 empty slots." },
+      { k: "Scorecard", op: "count slot-steps", where: "same 32 useful tokens", input: table(["", "static", "continuous"], [["steps to drain", 16, 12], ["useful slot-steps", "32 / 64", "32 / 48"], ["utilization", { v: "50%", color: "var(--bad)" }, { v: "67%", color: "var(--good)" }], ["E finishes at step", 16, 7]]), output: stack(h("div", { class: "stat good" }, h("span", { class: "k" }, "E's latency"), h("span", { class: "v" }, "16 → 7 steps")), cap("With a steady stream of arrivals, continuous batching keeps every slot busy, and utilization approaches 100%.")), note: "The scheduler re-decides batch membership every iteration, not every request. That is the whole trick." },
+    ];
+  };
+
+  /* ---------- Q7: chunked prefill ---------- */
+  LIA.topics.q7.trace = (M) => {
+    const BASE = 7, PER = 0.03, BUDGET = 2048, X = 8000, P = M.prompt.length; // mocked cost model: 8B on 1×H100
+    const ms = (pf) => BASE + PER * pf;
+    // chunked schedule: decodes first, then our (short) prefill, then chunk of X
+    const steps = [];
+    let remX = X, oursDecoding = false, oursTok = 0;
+    for (let i = 0; remX > 0; i++) {
+      const dec = 3 + (oursDecoding ? 1 : 0);
+      let budget = BUDGET - dec, oursPf = 0;
+      if (!oursDecoding) { oursPf = P; budget -= P; }
+      const xc = Math.min(remX, budget);
+      remX -= xc;
+      steps.push({ dec, oursPf, xc, t: ms(oursPf + xc), oursTok: oursDecoding || oursPf ? ++oursTok : 0 });
+      oursDecoding = true;
+    }
+    let acc = 0; steps.forEach((st) => { acc += st.t; st.end = acc; });
+    const tUn1 = ms(X), tUn2 = ms(P);
+    function bar(segs, total = BUDGET) {
+      const W = 380, sv = LIA.svg(W, 46, { "aria-label": "Step token budget" });
+      let x = 6;
+      segs.forEach((sg) => { const w = Math.max(2, (sg.v / total) * (W - 12)); sv.appendChild(s("rect", { x, y: 6, width: w, height: 20, fill: sg.c, rx: 2 })); if (w > 40) sv.appendChild(s("text", { x: x + w / 2, y: 20, "text-anchor": "middle", "font-size": 10, fill: "var(--surface)" }, sg.l)); x += w; });
+      sv.appendChild(s("text", { x: 6, y: 42, "font-size": 10, fill: "var(--muted)" }, `${fmt.num(segs.reduce((a, b) => a + b.v, 0))} / ${fmt.num(total)} token budget`));
+      return sv;
+    }
+    function timeline(mode) {
+      const W = 380, sv = LIA.svg(W, 74, { "aria-label": mode + " timeline" });
+      const sc = (W - 12) / 280;
+      const items = mode === "un" ? [{ t: tUn1, c: "var(--compute)", l: `X prefill ${fmt.num(tUn1, 0)} ms` }, { t: tUn2, c: "var(--accent)", l: "" }] : steps.map((st) => ({ t: st.t, c: "var(--compute)", l: `${fmt.num(st.t, 0)} ms` }));
+      let x = 6;
+      items.forEach((it) => { const w = it.t * sc; sv.appendChild(s("rect", { x, y: 8, width: Math.max(2, w - 2), height: 22, rx: 3, fill: it.c, opacity: 0.8 })); if (w > 50) sv.appendChild(s("text", { x: x + w / 2, y: 23, "text-anchor": "middle", "font-size": 10, fill: "var(--surface)" }, it.l)); x += w; });
+      const ttft = mode === "un" ? tUn1 + tUn2 : steps[0].t;
+      sv.appendChild(s("line", { x1: 6 + ttft * sc, x2: 6 + ttft * sc, y1: 4, y2: 44, stroke: "var(--accent)", "stroke-width": 2 }));
+      sv.appendChild(s("text", { x: Math.min(W - 4, 6 + ttft * sc + 4), y: 56, "text-anchor": ttft * sc > W / 2 ? "end" : "start", "font-size": 10.5, fill: "var(--accent)" }, `our first token “${M.output[0].t}” @ ${fmt.num(ttft, 1)} ms`));
+      sv.appendChild(s("text", { x: 6, y: 70, "font-size": 10, fill: "var(--muted)" }, "0 ms … 280 ms"));
+      return sv;
+    }
+    return [
+      { k: "Arrivals", op: "enqueue", where: "t = 0", inLabel: "Waiting (FCFS)", input: table(["request", "prompt", "state"], [[{ v: "X (mocked doc)", left: true }, "8,000", "waiting"], [{ v: "ours", left: true, bold: true }, P, "waiting"], [{ v: "D1–D3 (mocked)", left: true }, "–", "decoding"]]), outLabel: "Cost model (mocked, 8B on 1×H100)", output: LIA.formula(`step_ms = ${BASE} + ${PER} × prefill_tokens\nbudget  = ${fmt.num(BUDGET)} tokens / step`), note: "A huge document prompt landed just before our 28-token question, while three other users are mid-answer." },
+      { k: "No chunking: X", op: "prefill 8,000 tok", where: "one giant step", input: bar([{ v: X, c: "var(--compute)", l: "X 8,000 (over budget!)" }], X), output: stack(timeline("un"), LIA.kv([["step time", `${BASE} + ${PER} × 8,000 = ${fmt.num(tUn1, 0)} ms`], ["D1–D3", `stalled ${fmt.num(tUn1, 0)} ms (TPOT spike)`]])), note: "Everyone waits for one 247 ms step: the decoders' next token and our tiny prompt." },
+      { k: "No chunking: ours", op: "prefill 28 tok", where: "next step", input: LIA.tokens(M.prompt, { ids: false, cls: () => "hl", max: 12 }), output: LIA.kv([["step time", `${BASE} + ${PER} × ${P} = ${fmt.num(tUn2, 2)} ms`], ["our TTFT", `${fmt.num(tUn1, 0)} + ${fmt.num(tUn2, 2)} = ${fmt.num(tUn1 + tUn2, 1)} ms`]]), note: "Head-of-line blocking: 97% of our TTFT is someone else's prefill." },
+      { k: "Chunked: pack step 1", op: "fill 2,048-token budget", where: "decodes first, then prefills", input: table(["piece", "tokens"], [["D1–D3 decode", 3], [{ v: "ours (whole prompt)", bold: true }, P], ["X chunk 1", fmt.num(steps[0].xc)]]), output: stack(bar([{ v: 3, c: "var(--hbm)", l: "" }, { v: P, c: "var(--accent)", l: "" }, { v: steps[0].xc, c: "var(--compute)", l: `X ${fmt.num(steps[0].xc)}` }]), LIA.kv([["step time", `${BASE} + ${PER} × ${fmt.num(P + steps[0].xc)} = ${fmt.num(steps[0].t, 1)} ms`], ["our first token", `“${M.output[0].t}” at ${fmt.num(steps[0].t, 1)} ms`]])), note: "Our whole prompt fits beside the decodes, so we get a token in the very first step." },
+      { k: "Chunked: steps 2–4", op: "stream X in chunks", where: "ours now decoding", input: table(["step", "decode", "X chunk", "X left", "ms"], steps.map((st, i) => [i + 1, st.dec, fmt.num(st.xc), fmt.num(X - steps.slice(0, i + 1).reduce((a, b) => a + b.xc, 0)), fmt.num(st.t, 1)])), output: stack(timeline("ch"), LIA.tokens(M.output, { cls: (t, i) => (i < steps.length ? "out" : "dim") }), cap(`Ours emits “${M.output.slice(0, steps.length).map((t) => t.t).join("")}” while X is still prefilling.`)), note: "Each chunk attends to the KV of earlier chunks, so the result is identical to one big prefill." },
+      { k: "Scorecard", op: "compare", where: "same work, different order", input: table(["metric", "unchunked", "chunked"], [["our TTFT", fmt.num(tUn1 + tUn2, 1) + " ms", { v: fmt.num(steps[0].t, 1) + " ms", color: "var(--good)" }], ["worst decoder TPOT", fmt.num(tUn1, 0) + " ms", { v: fmt.num(Math.max(...steps.map((x) => x.t)), 1) + " ms", color: "var(--good)" }], ["X's TTFT", fmt.num(tUn1, 0) + " ms", { v: fmt.num(steps[steps.length - 1].end, 1) + " ms", color: "var(--warn)" }]]), output: cap("Chunking trades a little of the long prompt's TTFT (extra per-step overhead) for bounded TPOT and fast TTFT for everyone else."), note: "Smaller chunks cap TPOT harder but add more fixed overhead per step." },
+    ];
+  };
+
+  /* ---------- Q8: prefix caching + cache-aware routing ---------- */
+  LIA.topics.q8.trace = (M) => {
+    const B = 16;
+    const fnv = (parent, ids) => { let x = parent >>> 0 || 0x811c9dc5; for (const id of ids) { x ^= id; x = Math.imul(x, 0x01000193) >>> 0; x ^= id >>> 8; x = Math.imul(x, 0x01000193) >>> 0; } return x >>> 0; };
+    const hex = (x) => "0x" + x.toString(16).padStart(8, "0");
+    const ids = M.prompt.map((t) => t.id);
+    const h0 = fnv(0, ids.slice(0, B));
+    const r2 = M.prompt.slice(0, 21).concat([tk(" Japan", 6457), tk("?", 30), ...M.prompt.slice(23)]);
+    const same = (i) => r2[i].id === M.prompt[i].id;
+    let common = 0; while (common < r2.length && same(common)) common++;
+    const replicas = 4;
+    const repOf = (x) => x % replicas;
+    function tree() {
+      const sv = LIA.svg(380, 170, { "aria-label": "Radix tree" });
+      const node = (x, y, w, label, sub, fill) => { sv.appendChild(s("rect", { x, y, width: w, height: 34, rx: 6, fill, stroke: "var(--line)" })); sv.appendChild(s("text", { x: x + 6, y: y + 14, "font-size": 10.5, fill: "var(--ink)" }, label)); sv.appendChild(s("text", { x: x + 6, y: y + 28, "font-size": 9.5, fill: "var(--muted)" }, sub)); };
+      const edge = (x1, y1, x2, y2) => sv.appendChild(s("path", { d: `M${x1},${y1} C${x1},${(y1 + y2) / 2} ${x2},${(y1 + y2) / 2} ${x2},${y2}`, fill: "none", stroke: "var(--muted)" }));
+      sv.appendChild(s("circle", { cx: 190, cy: 10, r: 5, fill: "var(--muted)" }));
+      edge(190, 15, 190, 26);
+      node(70, 26, 240, "system prompt + user header", "16 tokens · shared", "var(--sram-soft)");
+      edge(190, 60, 190, 72);
+      node(110, 72, 160, "“What is the capital of”", "5 tokens · shared", "var(--sram-soft)");
+      edge(160, 106, 90, 124); edge(220, 106, 290, 124);
+      node(10, 124, 160, "“ France?” + asst hdr", "7 tokens · ours", "var(--accent-soft)");
+      node(210, 124, 160, "“ Japan?” + asst hdr", "7 tokens · request 2", "var(--hbm-soft)");
+      return sv;
+    }
+    function route(mode) {
+      const sv = LIA.svg(380, 120, { "aria-label": "Routing" });
+      for (let r = 0; r < replicas; r++) {
+        const x = 12 + r * 92;
+        const hot = r === repOf(h0);
+        sv.appendChild(s("rect", { x, y: 70, width: 80, height: 36, rx: 6, fill: hot ? "var(--sram-soft)" : "var(--surface-2)", stroke: hot ? "var(--sram)" : "var(--line)" }));
+        sv.appendChild(s("text", { x: x + 40, y: 86, "text-anchor": "middle", "font-size": 11, fill: "var(--ink)" }, `replica ${r}`));
+        sv.appendChild(s("text", { x: x + 40, y: 100, "text-anchor": "middle", "font-size": 9.5, fill: "var(--muted)" }, hot ? "has prefix" : "cold"));
+      }
+      const target1 = repOf(h0), target2 = mode === "rr" ? (target1 + 1) % replicas : target1;
+      [[target1, "ours", 110], [target2, "req 2", 270]].forEach(([r, l, sx], i) => {
+        const tx = 52 + r * 92;
+        sv.appendChild(s("text", { x: sx, y: 14, "text-anchor": "middle", "font-size": 11, fill: i ? "var(--hbm)" : "var(--accent)" }, l));
+        sv.appendChild(s("line", { x1: sx, y1: 20, x2: tx, y2: 66, stroke: i ? "var(--hbm)" : "var(--accent)", "stroke-width": 2 }));
+      });
+      sv.appendChild(s("text", { x: 190, y: 50, "text-anchor": "middle", "font-size": 11, "font-weight": 600, fill: mode === "rr" ? "var(--bad)" : "var(--good)" }, mode === "rr" ? "round-robin: req 2 lands cold → full prefill" : `hash(block 0) mod 4 = ${repOf(h0)} → cache hit`));
+      return sv;
+    }
+    return [
+      { k: "Split into blocks", op: "chunk by 16 tokens", where: "block manager", input: LIA.tokens(M.prompt), output: stack(LIA.tokens(M.prompt, { cls: (t, i) => (i < B ? "hl" : "out") }), cap(`Block 0 = tokens 0–15 (full). Block 1 = tokens 16–27 (${M.prompt.length - B}/16, partial).`)), note: "Only full blocks get a hash and become shareable. Our block 0 is exactly the system prompt plus the user header." },
+      { k: "Hash chain", op: "h = hash(parent, ids)", where: "toy FNV-1a hash", input: LIA.kv([["block 0 ids", ids.slice(0, B).join(", ")]]), output: LIA.kv([["hash(block 0)", hex(h0)], ["hash(block 1)", "— not full yet; hashed once 16 tokens exist"], ["cache table", `${hex(h0)} → physical block #42`]]), note: "Including the parent hash means a block only matches if everything before it matches too." },
+      { k: "Request 2 arrives", op: "tokenize + hash", where: "same system prompt (mocked)", inLabel: "Request 2: “…capital of Japan?”", input: LIA.tokens(r2, { cls: (t, i) => (same(i) ? "" : "hl") }), output: LIA.kv([["hash(block 0)", hex(fnv(0, r2.slice(0, B).map((t) => t.id))) + " ✓ same"], ["first differing token", `#${common}: “${LIA.showTok(r2[common].t)}” vs “${LIA.showTok(M.prompt[common].t)}”`]]), note: "Request 2 matches ours token-for-token up to “of”, then diverges." },
+      { k: "Block-level hit (vLLM)", op: "lookup hash table", where: "full blocks only", input: LIA.tokens(r2, { ids: false, cls: (t, i) => (i < B ? "hit" : "hl") }), output: LIA.kv([["reused", `${B} tokens (block 0) → ${fmt.bytes(B * KVB(), 2)} of KV`], ["recomputed", `${r2.length - B} tokens`], ["hit rate", fmt.pct(B / r2.length)]]), note: "Tokens 16–20 also match, but they sit in a block that differs later, so block hashing can't reuse them." },
+      { k: "Token-level hit (radix tree)", op: "walk the radix tree", where: "SGLang RadixAttention", input: tree(), output: stack(LIA.tokens(r2, { ids: false, cls: (t, i) => (i < common ? "hit" : "hl") }), LIA.kv([["reused", `${common} tokens`], ["recomputed", `${r2.length - common} tokens`], ["hit rate", fmt.pct(common / r2.length)]])), note: "Edges hold token runs; a new request walks down as far as it matches, so the hit can end mid-block." },
+      { k: "Cache-aware routing", op: "route by prefix hash", where: "load balancer, 4 replicas", input: route("rr"), output: route("hash"), note: "A cache only helps if the request reaches the replica holding it. Hashing the first block sends every user of this system prompt to the same replica." },
+    ];
+  };
+
+  /* ---------- Q9: TTFT and TPOT for our request ---------- */
+  LIA.topics.q9.trace = (M) => {
+    const cfg = { P: 70e9, gpus: 4 }, kv = M.model.kvBytesPerToken;
+    const BW = 3.35e12 * 0.8 * cfg.gpus, PEAK = 989e12 * 0.5 * cfg.gpus, OVH = 1.5;
+    const P = M.prompt.length, CTX = 2048;
+    const pfMem = (2 * cfg.P) / BW * 1000, pfCmp = (2 * cfg.P * P) / PEAK * 1000;
+    const ttft = Math.max(pfMem, pfCmp) + OVH;
+    const ridge = PEAK / BW;
+    const step = (B) => {
+      const kvBytes = (B - 1) * CTX * kv + (P + 4) * kv;
+      const mem = (2 * cfg.P + kvBytes) / BW * 1000, cmp = (2 * cfg.P * B) / PEAK * 1000;
+      return { kvBytes, mem, cmp, t: Math.max(mem, cmp) + OVH };
+    };
+    const s33 = step(33), s200 = step(200);
+    const kvCap = cfg.gpus * 80e9 * 0.9 - 2 * cfg.P;
+    const maxB = Math.floor(kvCap / (CTX * kv));
+    const times = [ttft]; for (let i = 1; i < M.output.length; i++) times.push(times[i - 1] + s33.t);
+    function tl() {
+      const W = 380, sv = LIA.svg(W, 70, { "aria-label": "Token timestamps" });
+      const sc = (W - 20) / (times[times.length - 1] * 1.05);
+      sv.appendChild(s("line", { x1: 8, x2: W - 8, y1: 30, y2: 30, stroke: "var(--line)" }));
+      times.forEach((t, i) => {
+        const x = 8 + t * sc;
+        sv.appendChild(s("circle", { cx: x, cy: 30, r: 5, fill: i ? "var(--hbm)" : "var(--accent)" }));
+        sv.appendChild(s("text", { x, y: i % 2 ? 52 : 18, "text-anchor": "middle", "font-size": 9.5, fill: "var(--ink)" }, LIA.showTok(M.output[i].t).replace("<|eot_id|>", "eot")));
+      });
+      sv.appendChild(s("text", { x: 8, y: 67, "font-size": 10, fill: "var(--muted)" }, `0 → ${fmt.num(times[times.length - 1], 1)} ms`));
+      return sv;
+    };
+    return [
+      { k: "Setup", op: "Llama-3 70B · 4×H100", where: "same model as the lab (70B option)", input: LIA.tokens(M.prompt, { ids: false, max: 14 }), outLabel: "Effective hardware", output: LIA.kv([["HBM BW (80%)", fmt.num(BW / 1e12, 2) + " TB/s"], ["peak (50% dense BF16)", fmt.num(PEAK / 1e15, 3) + " PFLOP/s"], ["weights", "140 GB (FP16)"], ["overhead / step", OVH + " ms"]]), note: "Our prompt is 28 tokens. Assume it is admitted immediately (no queue)." },
+      { k: "Prefill → TTFT", op: "max(bytes/BW, FLOPs/peak)", where: "28 tokens in one pass", input: LIA.kv([["bytes", "140 GB weights"], ["FLOPs", `2 × 70e9 × ${P} = ${fmt.si(2 * cfg.P * P, 2)}`]]), output: stack(LIA.formula(`mem  = 140e9 / ${fmt.num(BW / 1e12, 2)}e12 = <span class="hbm">${fmt.num(pfMem, 2)} ms</span>\ncomp = ${fmt.si(2 * cfg.P * P, 2)} / ${fmt.num(PEAK / 1e15, 3)}e15 = <span class="cmp">${fmt.num(pfCmp, 2)} ms</span>\nTTFT = ${fmt.num(Math.max(pfMem, pfCmp), 2)} + ${OVH} = <b>${fmt.num(ttft, 2)} ms</b>`)), note: "A 28-token prefill is memory-bound: the GPU must read every weight once no matter how short the prompt is." },
+      { k: "Ridge point", op: "where prefill flips", where: "peak / BW", input: LIA.formula(`N* = ${fmt.num(PEAK / 1e15, 3)}e15 / ${fmt.num(BW / 1e12, 2)}e12`), output: LIA.kv([["N*", `≈ ${fmt.num(ridge, 0)} prompt tokens`], ["ours", `${P} tokens → memory-bound`], ["a 2,048-token prompt", `→ compute-bound, ${fmt.num((2 * cfg.P * 2048) / PEAK * 1000 + OVH, 1)} ms`]]), note: "Below about 185 tokens, prefill costs the same as one decode step's weight read." },
+      { k: "Join a batch of 33", op: "decode step", where: "32 neighbors at 2,048 ctx (mocked)", input: LIA.kv([["weights", "140 GB"], ["KV of all 33 seqs", `32 × 2,048 + ${P + 4} tokens × 320 KiB = ${fmt.bytes(s33.kvBytes, 2)}`], ["FLOPs", `2 × 70e9 × 33 = ${fmt.si(2 * cfg.P * 33, 2)}`]]), output: LIA.formula(`mem  = (140e9 + ${fmt.num(s33.kvBytes / 1e9, 2)}e9) / BW = <span class="hbm">${fmt.num(s33.mem, 2)} ms</span>\ncomp = <span class="cmp">${fmt.num(s33.cmp, 2)} ms</span>\nTPOT = <b>${fmt.num(s33.t, 2)} ms</b> → ${fmt.num(1000 / s33.t, 0)} tok/s per user`), note: "Our 7 remaining tokens each cost one full step, shared with 32 other users." },
+      { k: "Token timestamps", op: "TTFT + 7 × TPOT", where: "what the user sees", input: LIA.tokens(M.output, { cls: () => "out" }), output: stack(tl(), LIA.kv([["last token", `${fmt.num(ttft, 2)} + 7 × ${fmt.num(s33.t, 2)} = ${fmt.num(times[times.length - 1], 1)} ms`]])), note: "Network time is ignored here; add ~20–80 ms of RTT for a real user." },
+      { k: "Batch 200 instead", op: "same step, more users", where: "operator's choice", input: table(["", "B = 33", "B = 200"], [["TPOT", fmt.num(s33.t, 1) + " ms", fmt.num(s200.t, 1) + " ms"], ["per user", fmt.num(1000 / s33.t, 0) + " tok/s", fmt.num(1000 / s200.t, 0) + " tok/s"], ["total", fmt.num((33 * 1000) / s33.t, 0) + " tok/s", { v: fmt.num((200 * 1000) / s200.t, 0) + " tok/s", color: "var(--good)" }], ["our answer", fmt.num(ttft + 7 * s33.t, 0) + " ms", fmt.num(ttft + 7 * s200.t, 0) + " ms"]]), output: LIA.kv([["KV capacity", `4 × 80 GB × 90% − 140 GB = ${fmt.bytes(kvCap, 0)}`], ["max batch @ 2,048 ctx", `${maxB} sequences`]]), note: `6× the users costs our request only ${fmt.num((s200.t / s33.t - 1) * 100, 0)}% more per token. Past ~${maxB} sequences the KV cache no longer fits.` },
+    ];
+  };
+
+  /* ---------- Q10: speculative decoding on our answer ---------- */
+  LIA.topics.q10.trace = (M) => {
+    const o = M.output;
+    // round 1: all 4 accepted + bonus; round 2: 1 accepted, then rejection → resample. Probabilities are mocked.
+    const r1 = [{ t: o[1], q: 0.62, p: 0.81, u: 0.44 }, { t: o[2], q: 0.9, p: 0.97, u: 0.12 }, { t: o[3], q: 0.8, p: 0.72, u: 0.31 }, { t: o[4], q: 0.71, p: 0.86, u: 0.58 }];
+    const bonus = o[5];
+    const r2 = [{ t: o[6], q: 0.88, p: 0.93, u: 0.27 }, { t: tk(" It", 1102), q: 0.41, p: 0.03, u: 0.52 }, { t: tk(" is", 374), q: 0.6, p: 0.5, u: 0 }, { t: tk(" also", 1101), q: 0.5, p: 0.4, u: 0 }];
+    const verdict = (row, i, rows) => {
+      const firstRej = rows.findIndex((r) => r.u >= Math.min(1, r.p / r.q));
+      if (firstRej >= 0 && i > firstRej) return { v: "drop", color: "var(--muted)" };
+      const a = Math.min(1, row.p / row.q);
+      return row.u < a ? { v: "✓", color: "var(--good)", bold: true } : { v: "✗", color: "var(--bad)", bold: true };
+    };
+    const rowsOf = (rows) => rows.map((r, i) => [{ v: LIA.showTok(r.t.t), left: true }, r.q.toFixed(2), r.p.toFixed(2), Math.min(1, r.p / r.q).toFixed(2), i > 1 && rows === r2 ? "–" : r.u.toFixed(2), verdict(r, i, rows)]);
+    const ctx = (n, extra) => LIA.tokens(M.prompt.slice(-4).concat(o.slice(0, n)), { ids: false, cls: (t, i) => (i < 4 ? "dim" : "out") });
+    const resid = [{ t: "<|eot_id|>", p: 0.71, q: 0.02 }, { t: " The", p: 0.09, q: 0.12 }, { t: " It", p: 0.03, q: 0.41 }, { t: "\\n\\n", p: 0.08, q: 0.2 }, { t: " (", p: 0.05, q: 0.04 }];
+    function residChart() {
+      const W = 360, sv = LIA.svg(W, 150, { "aria-label": "Residual distribution" });
+      const r = resid.map((x) => Math.max(0, x.p - x.q)); const z = r.reduce((a, b) => a + b, 0);
+      resid.forEach((x, i) => {
+        const y = 10 + i * 27, n = r[i] / z;
+        sv.appendChild(s("text", { x: 78, y: y + 13, "text-anchor": "end", "font-size": 10.5, fill: "var(--ink)" }, x.t));
+        sv.appendChild(s("rect", { x: 84, y: y + 2, width: Math.max(1, n * 200), height: 16, rx: 2, fill: n > 0.5 ? "var(--good)" : "var(--accent)", opacity: 0.8 }));
+        sv.appendChild(s("text", { x: 90 + n * 200, y: y + 14, "font-size": 10, fill: "var(--muted)" }, `max(0, ${x.p.toFixed(2)}−${x.q.toFixed(2)}) → ${n.toFixed(2)}`));
+      });
+      return sv;
+    }
+    const head = ["draft", "q", "p", "P(acc)", "u", ""];
+    return [
+      { k: "Context", op: "after prefill", where: "target already emitted “The”", input: LIA.tokens(M.prompt, { ids: false, cls: () => "dim", max: 10 }), output: stack(ctx(1), cap("Target: Llama-3 70B. Draft: a small same-tokenizer model (mocked, cost c = 0.05 of a target step).")), note: "Without speculation, the 7 remaining tokens would need 7 sequential 70B decode steps." },
+      { k: "Draft k = 4", op: "draft × 4 (cheap)", where: "small model, sequential", input: ctx(1), output: stack(LIA.tokens(r1.map((r) => r.t), { cls: () => "hl", sub: (t, i) => "q=" + r1[i].q.toFixed(2) })), note: "The draft guesses 4 tokens in a row, recording its own probability q for each pick." },
+      { k: "Verify in 1 pass", op: "target forward(4+1 pos)", where: "one memory-bound step", input: LIA.tokens(r1.map((r) => r.t), { cls: () => "hl" }), output: table(head, rowsOf(r1), "q = draft prob, p = target prob, P(acc) = min(1, p/q), u ~ U(0,1); accept if u < P(acc). Probabilities are mocked."), note: "“ France” has p < q but still passes: it is accepted with probability 0.72/0.80 = 0.90, and u = 0.31." },
+      { k: "Bonus token", op: "use 5th position", where: "free sample from target", input: LIA.tokens(r1.map((r) => r.t), { cls: () => "good" }), output: stack(LIA.tokens(o.slice(1, 6), { cls: (t, i) => (i < 4 ? "good" : "out"), sub: (t, i) => (i < 4 ? "accepted" : "bonus") }), ctx(6)), note: "All 4 accepted, so the target's distribution at position 5 is already computed. Sampling it gives “ Paris” for free: 5 tokens from one 70B pass." },
+      { k: "Round 2", op: "draft 4 → verify", where: "a miss this time", input: LIA.tokens(r2.map((r) => r.t), { cls: () => "hl", sub: (t, i) => "q=" + r2[i].q.toFixed(2) }), output: table(head, rowsOf(r2)), note: "“.” passes, but the draft wants to keep talking (“ It”), which the target finds very unlikely: accept prob 0.03/0.41 = 0.07 < u. Everything after the first rejection is discarded." },
+      { k: "Resample", op: "sample norm(max(0, p − q))", where: "keeps the output distribution exact", input: residChart(), output: stack(LIA.tokens(o.slice(0, 8), { cls: (t, i) => (i === 7 ? "good" : "out") }), cap("Result: <code>&lt;|eot_id|&gt;</code>, so the answer is complete.")), note: "Sampling from the clipped difference guarantees the final text is distributed exactly as if the 70B model had decoded alone." },
+      { k: "Accounting", op: "count passes", where: "7 decode tokens", input: table(["", "plain decode", "speculative"], [["70B passes", 7, 2], ["draft steps", 0, "8 × 0.05 = 0.4"], ["step-equivalents", 7, 2.4], ["tokens / 70B pass", 1, 3.5]]), output: stack(h("div", { class: "stat good" }, h("span", { class: "k" }, "Speedup on this answer"), h("span", { class: "v" }, "7 / 2.4 ≈ 2.9×")), cap("Matches the lab's formula at α ≈ 0.75, k = 4: E = (1 − α⁵)/(1 − α) ≈ 3.05 tokens per pass.")), note: "Round 1 gave 5 tokens (4 accepted + bonus), round 2 gave 2 (1 accepted + resample)." },
+    ];
+  };
 })();
