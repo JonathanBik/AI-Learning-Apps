@@ -4,6 +4,10 @@ An interactive, visualization-first course for the Inference AI Engineer curricu
 
 The worked example follows one mocked request, *“What is the capital of France?”* → *“The capital of France is Paris.”* (Llama-3-70B, 28 prompt tokens, 8 output tokens), through that topic's mechanism one step at a time. Each step shows the data going in, the operation, and the data coming out: JSON → chat template → token IDs → embeddings → Q/K/V → attention → logits → sampled token → SSE frame in Q1, and the same request's KV blocks, SSE frames, batch slot, draft tokens, quantized weights, kernel timeline, cost and so on in the other topics. Attention numbers come from a tiny deterministic toy model (`LIA.toy`, d_model 8, GQA 2:1) so every value shown is actually computed; values that are invented are labelled as mocked.
 
+### Terms explained in place
+
+Jargon is tappable. Terms like *TTFT*, *HBM*, *GQA*, *continuous batching* or *all-reduce* are underlined wherever they appear in ledes, key ideas, worked-example notes and quiz explanations. Tapping one opens a card with a plain one-line definition, a mini picture, how it works and why it matters, an everyday analogy, the formula, what it means for the mocked request, related terms, and a link to its lab. Each topic starts with a **Key terms** strip, and the **Glossary** page (`#glossary`) lists all 183 terms with search and category filters.
+
 ## Run it
 
 No build step and no dependencies. Open `index.html` in a browser, or serve the folder:
@@ -51,6 +55,8 @@ js/core.js        router, progress store, quiz engine, UI + SVG chart helpers (L
 js/m0.js          roadmap
 js/m1.js … m5b.js one file per module; each topic calls LIA.register({...})
 js/m1-trace.js    Module 1 worked examples (other modules keep theirs in the module file)
+js/glossary.js    term registry, auto-linking, explanation cards, Key terms strip, Glossary page
+js/terms-*.js     glossary entries (core, model, hardware, quant, serving, production)
 bundle.py         inline everything into one HTML file
 ```
 

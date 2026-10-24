@@ -78,7 +78,7 @@
     const rh = 20, lw = o.labelW || 84, sv = LIA.svg(W, rows.length * rh + 6);
     const max = o.max || Math.max(...rows.map((r) => r.value));
     rows.forEach((r, i) => {
-      const y = 3 + i * rh, w = Math.max(1.5, (r.value / max) * (W - lw - 54));
+      const y = 3 + i * rh, w = Math.max(1.5, (r.value / max) * (W - lw - (o.valW || 78)));
       sv.appendChild(txt(lw - 6, y + 13, r.label, { "text-anchor": "end", "font-size": 10 }));
       sv.appendChild(s("rect", { x: lw, y: y + 3, width: w, height: rh - 8, rx: 3, fill: r.color || "var(--accent)", opacity: 0.85 }));
       sv.appendChild(txt(lw + w + 5, y + 13, o.fmt ? o.fmt(r.value) : String(r.value), { "font-size": 10, "font-weight": 600 }));
