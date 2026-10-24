@@ -8,6 +8,9 @@
  *   lede     one-sentence framing under the title
  *   tags     [{label, kind}]           kind: accent|hbm|sram|compute|good|bad|warn
  *   render(stage)                      build the interactive lab into `stage` (a div.stage)
+ *   trace(MOCK) → [{k, op, where, input, output, note, inLabel?, outLabel?}]   (optional)
+ *            "Worked example": the shared mocked request (LIA.MOCK) traced step by step.
+ *            input/output are Nodes, html strings, or () => Node. See LIA.trace / tokens / matrix / kv / blob.
  *   insights [{t: 'Bold lead', d: 'one or two sentences'}]
  *   quiz     [{type:'mcq', prompt, options:[..], answer: idx, explain},
  *             {type:'num', prompt, answer, tol: 0.03 (relative), unit, explain},
@@ -415,6 +418,148 @@
     };
   };
 
+  /* ---------------- the running mocked example ----------------
+   * One request is followed through every topic's "Worked example" stepper.
+   * Token IDs follow the Llama-3 tokenizer for this text; treat them as illustrative.
+   */
+  const T = (t, id, extra) => Object.assign({ t, id }, extra || {});
+  const SP = { sp: true };
+  const prompt = [
+    T("<|begin_of_text|>", 128000, SP), T("<|start_header_id|>", 128006, SP), T("system", 9125), T("<|end_header_id|>", 128007, SP), T("\n\n", 271),
+    T("You", 2675), T(" are", 527), T(" a", 264), T(" helpful", 11190), T(" assistant", 18328), T(".", 13), T("<|eot_id|>", 128009, SP),
+    T("<|start_header_id|>", 128006, SP), T("user", 882), T("<|end_header_id|>", 128007, SP), T("\n\n", 271),
+    T("What", 3923), T(" is", 374), T(" the", 279), T(" capital", 6864), T(" of", 315), T(" France", 9822), T("?", 30), T("<|eot_id|>", 128009, SP),
+    T("<|start_header_id|>", 128006, SP), T("assistant", 78191), T("<|end_header_id|>", 128007, SP), T("\n\n", 271),
+  ];
+  const output = [T("The", 791), T(" capital", 6864), T(" of", 315), T(" France", 9822), T(" is", 374), T(" Paris", 12366), T(".", 13), T("<|eot_id|>", 128009, SP)];
+  LIA.MOCK = {
+    id: "req-7f3a",
+    system: "You are a helpful assistant.",
+    user: "What is the capital of France?",
+    answer: "The capital of France is Paris.",
+    request: { model: "llama-3-70b-instruct", stream: true, max_tokens: 64, temperature: 0.7, top_p: 0.9, messages: [{ role: "system", content: "You are a helpful assistant." }, { role: "user", content: "What is the capital of France?" }] },
+    prompt,
+    output,
+    /** the 7 user-question tokens, used where a full 28×28 matrix would be unreadable */
+    question: prompt.slice(16, 23),
+    model: { name: "Llama-3-70B", L: 80, Hq: 64, Hkv: 8, dHead: 128, dModel: 8192, params: 70.6e9, kvBytesPerToken: 327680 },
+    /** next-token candidates at the last prompt position (mocked logits, chosen so the real answer wins) */
+    candidates: [T("The", 791, { logit: 6.2 }), T("Paris", 60704, { logit: 5.1 }), T(" The", 578, { logit: 4.3 }), T("France", 50100, { logit: 3.0 }), T("It", 2181, { logit: 2.6 }), T("Sure", 40914, { logit: 1.9 }), T("I", 40, { logit: 0.8 })],
+  };
+  LIA.MOCK.templated = prompt.map((x) => x.t).join("");
+
+  /* tiny deterministic "transformer" so worked examples show real arithmetic.
+     d_model = 8, two query heads of d_head = 4 sharing ONE KV head (GQA 2:1). */
+  const TOY = { d: 8, dh: 4 };
+  const randMat = (seed, r, c, scale = 1) => { const g = LIA.rng(seed); return Array.from({ length: r }, () => Array.from({ length: c }, () => +((g() * 2 - 1) * scale).toFixed(2))); };
+  const matmul = (A, B) => A.map((row) => B[0].map((_, j) => row.reduce((a, v, k) => a + v * B[k][j], 0)));
+  const Wq = randMat(11, TOY.d, TOY.d, 1.2), Wk = randMat(12, TOY.d, TOY.dh, 1.2), Wv = randMat(13, TOY.d, TOY.dh, 0.6);
+  LIA.toy = {
+    dims: TOY,
+    matmul,
+    embed(tokens) { return tokens.map((tk) => randMat(1000 + (tk.id % 9973), 1, TOY.d, 1)[0]); },
+    weights: { Wq, Wk, Wv },
+    /** causal attention for one query head over `tokens`. Returns every intermediate. */
+    attention(tokens, head = 0) {
+      const X = LIA.toy.embed(tokens);
+      const Qall = matmul(X, Wq);
+      const Q = Qall.map((r) => r.slice(head * TOY.dh, head * TOY.dh + TOY.dh));
+      const K = matmul(X, Wk), V = matmul(X, Wv);
+      const sc = 1 / Math.sqrt(TOY.dh);
+      const S = Q.map((q, i) => K.map((k, j) => (j <= i ? q.reduce((a, v, x) => a + v * k[x], 0) * sc : -Infinity)));
+      const P = S.map((row) => { const m = Math.max(...row); const e = row.map((v) => (v === -Infinity ? 0 : Math.exp(v - m))); const z = e.reduce((a, b) => a + b, 0); return e.map((v) => v / z); });
+      const O = matmul(P, V);
+      return { X, Q, Qall, K, V, S, P, O };
+    },
+    softmax(xs, temp = 1) { const m = Math.max(...xs); const e = xs.map((v) => Math.exp((v - m) / temp)); const z = e.reduce((a, b) => a + b, 0); return e.map((v) => v / z); },
+  };
+
+  /* ---------------- worked-example widgets ---------------- */
+  const showTok = (s) => s.replace(/\n/g, "⏎").replace(/^ /, "␣");
+  /** tokens(list, {ids, cls(tok,i) → 'hl'|'out'|'dim'|..., max}) → chip row */
+  LIA.tokens = function (list, o = {}) {
+    const max = o.max || list.length;
+    const chips = list.slice(0, max).map((tk, i) => {
+      const extra = o.cls ? o.cls(tk, i) || "" : "";
+      return h("span", { class: "tok " + (tk.sp ? "special " : "") + extra, title: `id ${tk.id}` }, showTok(tk.t), o.ids === false ? null : h("small", null, o.sub ? o.sub(tk, i) : tk.id));
+    });
+    if (list.length > max) chips.push(h("span", { class: "tok dim" }, `+${list.length - max} more`));
+    return h("div", { class: "toks" }, chips);
+  };
+  LIA.showTok = showTok;
+  /** matrix(M, {rows, cols, d, color:'var(--compute)', diverge, caption, max}) → heat-shaded table */
+  LIA.matrix = function (M, o = {}) {
+    const d = o.d ?? 2;
+    const finite = M.flat().filter((v) => isFinite(v));
+    const max = o.max || Math.max(1e-9, ...finite.map(Math.abs));
+    const pos = o.color || "var(--compute)", neg = o.neg || "var(--hbm)";
+    const rows = M.map((row, i) => h("tr", null,
+      o.rows ? h("th", null, o.rows[i]) : null,
+      row.map((v, j) => {
+        if (!isFinite(v)) return h("td", { class: "masked" }, v < 0 ? "−∞" : "∞");
+        const pct = Math.round((Math.abs(v) / max) * (o.strength || 55));
+        const col = o.diverge && v < 0 ? neg : pos;
+        const hl = o.highlight && o.highlight(i, j);
+        return h("td", { style: { background: `color-mix(in srgb, ${col} ${pct}%, transparent)`, outline: hl ? "2px solid var(--accent)" : null } }, (o.fmt ? o.fmt(v) : v.toFixed(d)));
+      })
+    ));
+    return h("div", { class: "mat-wrap" }, h("table", { class: "mat" },
+      o.caption ? h("caption", null, o.caption) : null,
+      o.cols ? h("thead", null, h("tr", null, o.rows ? h("th") : null, o.cols.map((c) => h("th", null, c)))) : null,
+      h("tbody", null, rows)));
+  };
+  /** kv([[key, value], ...]) → definition list */
+  LIA.kv = (pairs) => h("dl", { class: "kv" }, pairs.map(([k, v]) => [h("dt", null, k), h("dd", null, v instanceof Node ? v : String(v))]));
+  /** blob(html) → monospace block for raw payloads */
+  LIA.blob = (html) => h("pre", { class: "blob", html });
+  LIA.esc = (s) => String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+
+  /**
+   * trace(steps) — the "Worked example" stepper.
+   * step = { k: 'Tokenize', op: 'BPE', where: 'CPU · API server', input, output, note }
+   *   input/output: Node | html string | () => Node   (functions are built lazily)
+   */
+  LIA.trace = function (steps) {
+    let i = 0, timer = null;
+    const seen = new Set([0]);
+    const chips = steps.map((st, j) => h("button", { type: "button", onClick: () => go(j, true) }, h("i", null, j + 1), st.k));
+    const body = h("div", { class: "trace-body" });
+    const note = h("div", { class: "trace-note" });
+    const count = h("span", { class: "count" });
+    const prev = LIA.button("← Prev", () => go(i - 1, true));
+    const next = LIA.button("Next step →", () => go(i + 1, true), "primary");
+    const play = LIA.button("▶ Auto-play", () => {
+      if (timer) { stop(); return; }
+      if (i >= steps.length - 1) go(0);
+      play.textContent = "❚❚ Pause";
+      timer = LIA.every(3800, () => { if (i >= steps.length - 1) stop(); else go(i + 1); });
+    });
+    function stop() { if (timer) timer(); timer = null; play.textContent = "▶ Auto-play"; }
+    const build = (x) => (typeof x === "function" ? x() : typeof x === "string" ? h("div", { html: x }) : x);
+    function col(label, content) { return h("div", { class: "trace-col" }, h("span", { class: "lbl" }, label), content ? build(content) : h("span", { class: "caption" }, "—")); }
+    function go(j, user) {
+      if (user) stop();
+      i = LIA.clamp(j, 0, steps.length - 1);
+      seen.add(i);
+      const st = steps[i];
+      chips.forEach((c, n) => { c.setAttribute("aria-current", n === i ? "step" : "false"); c.classList.toggle("seen", seen.has(n)); });
+      chips[i].scrollIntoView({ block: "nearest", inline: "nearest" });
+      LIA.clear(body).append(
+        col(st.inLabel || "Input", st.input),
+        h("div", { class: "trace-op" }, h("span", { class: "arrow" }, "→"), h("span", { class: "op" }, st.op || st.k), st.where ? h("span", { class: "where" }, st.where) : null),
+        col(st.outLabel || "Output", st.output)
+      );
+      note.innerHTML = st.note || "";
+      note.hidden = !st.note;
+      prev.disabled = i === 0;
+      next.disabled = i === steps.length - 1;
+      count.textContent = `step ${i + 1} / ${steps.length}`;
+    }
+    const el = h("div", { class: "trace" }, h("div", { class: "trace-steps", role: "tablist" }, chips), body, note, h("div", { class: "trace-nav" }, prev, next, play, count));
+    go(0);
+    return el;
+  };
+
   /* ---------------- progress store ---------------- */
   const KEY = "lia.v1";
   let store = { quiz: {}, free: {}, last: null };
@@ -580,6 +725,10 @@
     const idx = ids.indexOf(id);
     const prev = topics[ids[idx - 1]], next = topics[ids[idx + 1]];
     const stage = h("div", { class: "stage" });
+    let traceEl = null;
+    if (topics[id].trace) {
+      try { traceEl = LIA.trace(topics[id].trace(LIA.MOCK)); } catch (e) { console.error(e); traceEl = h("div", { class: "caption" }, "Worked example failed to load: " + e.message); }
+    }
     const topic = h("article", { class: "topic" },
       h("header", { class: "topic-head" },
         h("div", { class: "crumbs" },
@@ -591,6 +740,7 @@
         t.lede ? h("p", { class: "lede", html: t.lede }) : null
       ),
       LIA.panel(t.labTitle || "Interactive lab", stage),
+      traceEl ? LIA.panel(h("span", null, "Worked example · ", h("span", { style: { textTransform: "none", letterSpacing: 0, fontFamily: "var(--f-body)", fontWeight: 400 } }, `“${LIA.MOCK.user}” → “${LIA.MOCK.answer}”`)), traceEl) : null,
       t.insights && t.insights.length ? LIA.panel("Key ideas", h("div", { class: "insights" }, t.insights.map((x) => h("div", { class: "insight" }, h("div", null, h("b", null, x.t), " ", h("span", { html: x.d })))))) : null,
       t.quiz && t.quiz.length ? LIA.panel("Checkpoint", renderQuiz(t)) : null,
       h("nav", { class: "pager" },
