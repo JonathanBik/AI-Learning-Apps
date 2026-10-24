@@ -4,6 +4,380 @@
   const { h, s, fmt } = LIA;
 
   /* =====================================================================
+   * Worked-example traces: the shared mocked request (LIA.MOCK) through each mechanism.
+   * Values marked "mocked" are invented for illustration; everything else is computed.
+   * ===================================================================== */
+  const fnv1a = (str) => { let x = 0x811c9dc5; for (let i = 0; i < str.length; i++) { x ^= str.charCodeAt(i); x = Math.imul(x, 0x01000193) >>> 0; } return x >>> 0; };
+  /** murmur3 finalizer: spreads FNV output so similar names land far apart on the ring */
+  const fmix = (x) => { x ^= x >>> 16; x = Math.imul(x, 0x85ebca6b); x ^= x >>> 13; x = Math.imul(x, 0xc2b2ae35); x ^= x >>> 16; return x >>> 0; };
+  const hex = (n) => n.toString(16).padStart(8, "0");
+  /** stacked horizontal bar: segs [{v, c, l}] → small svg */
+  function splitBar(segs, o = {}) {
+    const W = o.width || 380, H = o.height || 46;
+    const tot = o.total || segs.reduce((a, b) => a + b.v, 0);
+    const sv = LIA.svg(W, H);
+    let x = 0;
+    segs.forEach((sg) => {
+      const w = (sg.v / tot) * W;
+      sv.appendChild(s("rect", { x, y: 4, width: Math.max(0, w - 1), height: 20, rx: 3, fill: sg.c, opacity: sg.o ?? 0.85 }));
+      if (sg.l && w > 34) sv.appendChild(s("text", { x: x + w / 2, y: 18, "text-anchor": "middle", "font-size": 10.5, fill: "var(--surface)", "font-weight": 600 }, sg.l));
+      x += w;
+    });
+    if (o.marker != null) {
+      const mx = (o.marker / tot) * W;
+      sv.appendChild(s("path", { d: `M${mx},2 l-5,-0 l5,8 l5,-8 z`, fill: "var(--ink)" }));
+      sv.appendChild(s("line", { x1: mx, x2: mx, y1: 4, y2: 26, stroke: "var(--ink)", "stroke-width": 2 }));
+      if (o.markerLabel) sv.appendChild(s("text", { x: LIA.clamp(mx, 40, W - 40), y: 40, "text-anchor": "middle", "font-size": 11, fill: "var(--ink)" }, o.markerLabel));
+    } else if (o.caption) sv.appendChild(s("text", { x: 0, y: 40, "font-size": 11, fill: "var(--muted)" }, o.caption));
+    return sv;
+  }
+  /** label/value bar rows with an optional limit tick: rows [{l, v, c, limit}] */
+  function barRows(rows, o = {}) {
+    const W = 380, rh = 26, lw = o.labelW || 110, vw = 70;
+    const max = o.max || Math.max(...rows.map((r) => Math.max(r.v, r.limit || 0))) * 1.08;
+    const sv = LIA.svg(W, rows.length * rh + 6);
+    rows.forEach((r, i) => {
+      const y = 3 + i * rh, X = (v) => lw + (v / max) * (W - lw - vw);
+      sv.appendChild(s("text", { x: lw - 6, y: y + 15, "text-anchor": "end", "font-size": 11, fill: "var(--ink)" }, r.l));
+      sv.appendChild(s("rect", { x: lw, y: y + 4, width: Math.max(1, X(r.v) - lw), height: 15, rx: 3, fill: r.c || "var(--accent)" }));
+      sv.appendChild(s("text", { x: X(r.v) + 5, y: y + 15, "font-size": 11, "font-weight": 600, fill: "var(--ink)" }, r.t || fmt.num(r.v)));
+      if (r.limit != null) sv.appendChild(s("line", { x1: X(r.limit), x2: X(r.limit), y1: y + 1, y2: y + 22, stroke: "var(--bad)", "stroke-width": 2, "stroke-dasharray": "3 2" }));
+    });
+    return sv;
+  }
+  const div = (...kids) => h("div", { style: { display: "flex", flexDirection: "column", gap: "8px", minWidth: 0 } }, kids);
+  const mocked = () => LIA.pill("mocked", "warn");
+  const PROMPT_N = () => LIA.MOCK.prompt.length;
+  const OUT_N = () => LIA.MOCK.output.length;
+
+  const TRACES = {};
+
+  /* ---------- Q19: the request during a 5% canary ---------- */
+  TRACES.q19 = (M) => {
+    let uid = 48213, bucket;
+    for (;; uid++) { bucket = fnv1a("u_" + uid) % 100; if (bucket < 5) break; }
+    const user = "u_" + uid, hsh = fnv1a(user);
+    const gates = [
+      { l: "TTFT p99", base: 800, can: 1350, limit: 960, unit: "ms", bad: true },
+      { l: "Error rate", base: 0.3, can: 0.4, limit: 1.0, unit: "%", bad: true },
+      { l: "Eval score", base: 0.86, can: 0.86, limit: 0.84, unit: "", bad: false },
+    ];
+    const pass = (g) => (g.bad ? g.can <= g.limit : g.can >= g.limit);
+    const sent = 5;
+    return [
+      {
+        k: "Arrive", op: "POST /v1/chat/completions", where: "edge gateway",
+        input: () => LIA.blob(LIA.esc(JSON.stringify(M.request, null, 1))),
+        output: () => div(LIA.kv([["x-request-id", M.id], ["x-user-id", user], ["rollout", "llama-70b v2 canary at 5%"]]), mocked()),
+        note: "A rollout is running: v2 of the engine build gets 5% of traffic, v1 (stable) the rest.",
+      },
+      {
+        k: "Assign cohort", op: "fnv1a(user_id) mod 100", where: "router",
+        input: () => LIA.kv([["user_id", user], ["fnv1a", "0x" + hex(hsh)], ["mod 100", String(bucket)]]),
+        output: () => div(splitBar([{ v: 5, c: "var(--compute)", l: "" }, { v: 95, c: "var(--accent)", o: 0.35, l: "stable v1 · 95%" }], { total: 100, marker: bucket + 0.5, markerLabel: `bucket ${bucket} < 5 → canary v2` })),
+        note: "Hashing the user, not the request, keeps one user on one version for the whole conversation. Same user, same bucket, every time.",
+      },
+      {
+        k: "Serve on canary", op: "generate on v2 pod", where: "canary-pod-0",
+        input: () => LIA.tokens(M.prompt, { max: 14, ids: false }),
+        output: () => div(LIA.tokens(M.output, { cls: () => "out" }), LIA.kv([["TTFT", "1,410 ms"], ["TPOT", "26 ms"], ["eval sample score", "0.87"]]), mocked()),
+        note: "The answer is correct, but first-token latency is high. One request proves nothing; the gate looks at the whole canary window.",
+      },
+      {
+        k: "Gate check", op: "compare window vs baseline", where: "rollout controller",
+        inLabel: "Canary window (5% of traffic, 10 min)",
+        input: () => div(barRows(gates.map((g) => ({ l: g.l, v: g.can / (g.unit === "ms" ? 1000 : 1), t: g.unit === "ms" ? fmt.num(g.can) + " ms" : g.can + g.unit, c: pass(g) ? "var(--good)" : "var(--bad)", limit: g.limit / (g.unit === "ms" ? 1000 : 1) })), { max: 1.6 }), LIA.caption("dashed red = gate limit (TTFT: baseline 800 ms × 1.2 = 960 ms)")),
+        output: () => div(...gates.map((g) => LIA.pill(`${g.l}: ${pass(g) ? "pass" : "FAIL"}`, pass(g) ? "good" : "bad"))),
+        note: "TTFT p99 is 1,350 ms against a 960 ms limit. One failed gate is enough to stop the rollout.",
+      },
+      {
+        k: "Roll back", op: "set canary weight 5% → 0%", where: "router config",
+        input: () => splitBar([{ v: 5, c: "var(--compute)" }, { v: 95, c: "var(--accent)", l: "v1 95%" }], { total: 100, caption: "before: 5% canary" }),
+        output: () => splitBar([{ v: 100, c: "var(--accent)", l: "v1 100%" }], { total: 100, caption: "after: 0% canary, no new requests reach v2" }),
+        note: "Rollback is a config change in the router, so it takes effect in seconds without redeploying anything.",
+      },
+      {
+        k: "Drain in-flight", op: "SIGTERM + grace period", where: "canary-pod-0",
+        inLabel: `Our stream when rollback fires (${sent}/${OUT_N()} sent)`,
+        input: () => LIA.tokens(M.output, { cls: (t, i) => (i < sent ? "out" : "dim") }),
+        output: () => div(LIA.tokens(M.output, { cls: () => "out" }), LIA.kv([["pod state", "draining → terminated"], ["new requests", "rejected (removed from LB)"], ["grace period", "120 s"]])),
+        note: "The pod stops accepting work but finishes open SSE streams. Killing it outright would cut this answer off after “France”.",
+      },
+      {
+        k: "Next turn", op: "same hash, weight 0", where: "router",
+        input: () => LIA.kv([["user_id", user], ["bucket", String(bucket)], ["canary weight", "0%"]]),
+        output: () => div(LIA.pill("routed to stable v1", "accent")),
+        note: "The bucket is unchanged, but the canary range is now empty, so the user's next message lands on v1.",
+      },
+    ];
+  };
+
+  /* ---------- Q20: the request during a traffic spike ---------- */
+  TRACES.q20 = (M) => {
+    const R = 4, per = 4, arr = 18, ahead = 37; // replicas, req/s per replica, arrivals/s, queue ahead (mocked)
+    const cap = R * per, wait = ahead / cap;
+    const perRep = (ahead + 1) / R, target = 4;
+    const raw = Math.ceil((R * perRep) / target), desired = Math.min(raw, R * 2);
+    const cold = [
+      { l: "provision node", v: 60, c: "var(--muted)" },
+      { l: "pull image", v: 45, c: "var(--accent)" },
+      { l: "download 140 GB", v: 70, c: "var(--hbm)" },
+      { l: "load to GPUs", v: 12, c: "var(--compute)" },
+      { l: "warmup + graphs", v: 20, c: "var(--sram)" },
+    ];
+    const coldT = cold.reduce((a, b) => a + b.v, 0);
+    const warm = [{ l: "pre-warmed pool", v: 0 }, { l: "pull (cached)", v: 0 }, { l: "load from NVMe", v: 20 }, { l: "load to GPUs", v: 12 }, { l: "warmup + graphs", v: 20 }];
+    const warmT = warm.reduce((a, b) => a + b.v, 0);
+    const backlog = ahead + (arr - cap) * coldT, drainRate = desired * per - arr, drainT = backlog / drainRate;
+    const prefill = 0.06, ttft = wait + prefill;
+    return [
+      {
+        k: "Arrive in a spike", op: "enqueue", where: "10:02 · spike",
+        input: () => div(LIA.tokens(M.prompt, { max: 10, ids: false }), LIA.kv([["arrivals", arr + " req/s"], ["capacity", `${R} replicas × ${per} req/s = ${cap} req/s`]]), mocked()),
+        output: () => div(barRows([{ l: "arrivals", v: arr, c: "var(--bad)", t: arr + " req/s" }, { l: "capacity", v: cap, c: "var(--good)", t: cap + " req/s" }]), LIA.kv([["queue position", "#" + (ahead + 1)], ["queue grows", `${arr - cap} req/s`]])),
+        note: "Arrivals exceed capacity, so the queue grows by 2 requests every second until something changes.",
+      },
+      {
+        k: "Scaling signal", op: "desired = ⌈R · metric / target⌉", where: "autoscaler (every 15 s)",
+        input: () => LIA.kv([["metric", "queue depth per replica"], ["value", `${ahead + 1} / ${R} = ${fmt.num(perRep, 2)}`], ["target", String(target)], ["replicas R", String(R)]]),
+        output: () => div(LIA.kv([["raw desired", `⌈${R} × ${fmt.num(perRep, 2)} / ${target}⌉ = ${raw}`], ["policy: max +100% per step", `→ ${desired} replicas`]]), LIA.pill(`+${desired - R} replicas requested`, "accent")),
+        note: "Queue depth reacts immediately. GPU utilization would already read ~100% and could not show how far behind the system is.",
+      },
+      {
+        k: "Cold start", op: "boot a new replica", where: "new node",
+        inLabel: "From scratch",
+        input: () => div(splitBar(cold.map((c) => ({ v: c.v, c: c.c, l: c.v + "s" })), { caption: `total ${coldT} s ≈ ${fmt.num(coldT / 60, 1)} min` }), LIA.kv(cold.map((c) => [c.l, c.v + " s"])), mocked()),
+        outLabel: "With pre-warmed pool + NVMe weights",
+        output: () => div(splitBar(warm.filter((c) => c.v).map((c, i) => ({ v: c.v, c: ["var(--hbm)", "var(--compute)", "var(--sram)"][i], l: c.v + "s" })), { total: coldT, caption: `total ${warmT} s` }), LIA.kv(warm.map((c) => [c.l, c.v + " s"]))),
+        note: `Downloading 140 GB of weights at 2 GB/s is 70 s on its own. Keeping nodes warm and weights on local disk cuts ${coldT} s to ${warmT} s.`,
+      },
+      {
+        k: "Our request waits", op: "FIFO on existing replicas", where: "replica-2",
+        input: () => LIA.kv([["requests ahead", String(ahead)], ["drain rate", cap + " req/s"]]),
+        output: () => div(barRows([{ l: "queue wait", v: wait, c: "var(--warn)", t: fmt.num(wait, 2) + " s" }, { l: "TTFT", v: ttft, c: ttft > 2 ? "var(--bad)" : "var(--good)", t: fmt.num(ttft, 2) + " s", limit: 2 }], { max: 3 }), LIA.caption("dashed red = 2 s TTFT SLO")),
+        note: `Our request is served by an old replica after ${fmt.num(wait, 2)} s, long before the new one is ready. Scaling helps the requests that arrive later, not this one.`,
+      },
+      {
+        k: "Backlog builds", op: "arrivals − capacity during cold start", where: `${coldT} s`,
+        input: () => LIA.kv([["start queue", String(ahead)], ["growth", `${arr - cap} req/s × ${coldT} s`]]),
+        output: () => div(LIA.kv([["queue when replicas arrive", fmt.num(backlog)], ["worst wait", fmt.num(backlog / cap, 1) + " s"]]), LIA.pill("SLO violated for minutes", "bad")),
+        note: "This is why cold start time, not the scaling formula, decides how bad a spike gets.",
+      },
+      {
+        k: "Recover", op: `${desired} replicas serving`, where: "after scale-up",
+        input: () => barRows([{ l: "capacity", v: desired * per, c: "var(--good)", t: desired * per + " req/s" }, { l: "arrivals", v: arr, c: "var(--bad)", t: arr + " req/s" }]),
+        output: () => LIA.kv([["drain rate", `${desired * per} − ${arr} = ${drainRate} req/s`], ["backlog cleared in", fmt.num(drainT, 0) + " s"]]),
+        note: "Extra capacity first eats the backlog, then the autoscaler scales back down slowly to avoid flapping.",
+      },
+    ];
+  };
+
+  /* ---------- Q21: the request in a weighted fair queue ---------- */
+  TRACES.q21 = (M) => {
+    const est = PROMPT_N() + M.request.max_tokens; // reserved tokens
+    const actual = PROMPT_N() + OUT_N();
+    const bucket = 1240, V = 1000;
+    const tenants = { "acme-pro": 4, internal: 2, "free-burst": 1 };
+    const lastF = { "acme-pro": 1010, internal: 1020, "free-burst": 1000 };
+    const queue = [];
+    // noisy tenant already queued 12 requests of 200 tokens each (arrived first)
+    let f = lastF["free-burst"];
+    for (let i = 0; i < 12; i++) { f = Math.max(V, f) + 200 / tenants["free-burst"]; queue.push({ who: "free-burst", n: i + 1, cost: 200, F: f, arr: i }); }
+    const intF = Math.max(V, lastF.internal) + 60 / tenants.internal;
+    queue.push({ who: "internal", n: 1, cost: 60, F: intF, arr: 12 });
+    const ourF = Math.max(V, lastF["acme-pro"]) + est / tenants["acme-pro"];
+    queue.push({ who: "acme-pro", n: 1, cost: est, F: ourF, arr: 13, ours: true });
+    const sorted = [...queue].sort((a, b) => a.F - b.F);
+    const pos = sorted.findIndex((q) => q.ours) + 1;
+    const fifoPos = queue.findIndex((q) => q.ours) + 1;
+    const color = { "acme-pro": "var(--accent)", internal: "var(--sram)", "free-burst": "var(--hbm)" };
+    const qViz = (list) => {
+      const W = 380, sv = LIA.svg(W, 64);
+      const w = W / list.length;
+      list.forEach((q, i) => {
+        sv.appendChild(s("rect", { x: i * w + 1, y: 6, width: w - 2, height: 26, rx: 3, fill: color[q.who], opacity: q.ours ? 1 : 0.5, stroke: q.ours ? "var(--ink)" : "none", "stroke-width": 2 }));
+        sv.appendChild(s("text", { x: i * w + w / 2, y: 46, "text-anchor": "middle", "font-size": 9.5, fill: "var(--muted)" }, String(i + 1)));
+      });
+      sv.appendChild(s("text", { x: 0, y: 61, "font-size": 10.5, fill: "var(--muted)" }, "■ acme-pro  ■ internal  ■ free-burst   (front of queue on the left)"));
+      return sv;
+    };
+    return [
+      {
+        k: "Tag tenant", op: "API key → tenant", where: "auth",
+        input: () => LIA.kv([["Authorization", "Bearer sk-…9f2c"], ["request", M.id]]),
+        output: () => div(LIA.kv([["tenant", "acme-pro"], ["weight", "4"], ["rate limit", "50,000 tokens / min"]]), mocked()),
+        note: "Every scheduling decision below depends on knowing whose request this is.",
+      },
+      {
+        k: "Token bucket", op: "reserve prompt + max_tokens", where: "rate limiter",
+        input: () => div(LIA.kv([["prompt tokens", String(PROMPT_N())], ["max_tokens", String(M.request.max_tokens)], ["reserve", `${PROMPT_N()} + ${M.request.max_tokens} = ${est}`]])),
+        output: () => div(barRows([{ l: "bucket before", v: bucket, c: "var(--good)", t: fmt.num(bucket) }, { l: "bucket after", v: bucket - est, c: "var(--good)", t: fmt.num(bucket - est) }], { max: 1400 }), LIA.pill("allowed (no 429)", "good")),
+        note: "The limiter cannot know the output length yet, so it reserves the worst case and refunds the difference later.",
+      },
+      {
+        k: "Virtual finish time", op: "F = max(V, F_last) + cost / weight", where: "WFQ scheduler",
+        input: () => LIA.kv([["system virtual time V", String(V)], ["acme-pro last F", String(lastF["acme-pro"])], ["cost / weight", `${est} / 4 = ${est / 4}`]]),
+        output: () => div(LIA.kv([["F (ours)", `max(${V}, ${lastF["acme-pro"]}) + ${est / 4} = ${ourF}`], ["F (internal, 60 tok, w=2)", String(intF)], ["F (free-burst #1…#12, 200 tok, w=1)", `${queue[0].F} … ${queue[11].F}`]])),
+        note: "Weight 4 means each acme-pro token advances virtual time 4× slower than a free-tier token.",
+      },
+      {
+        k: "Order the queue", op: "sort by F", where: "WFQ scheduler",
+        inLabel: "Arrival order (FIFO)",
+        input: () => div(qViz(queue), LIA.caption(`ours is #${fifoPos} in arrival order`)),
+        outLabel: "Fair-queue order",
+        output: () => div(qViz(sorted), LIA.caption(`ours is #${pos} by virtual finish time`)),
+        note: "The noisy tenant arrived first with 12 big requests, but it cannot push acme-pro to the back of the line.",
+      },
+      {
+        k: "Dequeue", op: "admit to next engine step", where: "engine",
+        input: () => LIA.matrix(sorted.slice(0, 4).map((q) => [q.F, q.cost]), { rows: sorted.slice(0, 4).map((q) => q.who + (q.ours ? " ★" : "")), cols: ["F", "tokens"], d: 0, color: "var(--accent)" }),
+        output: () => div(barRows([{ l: "FIFO wait", v: (fifoPos - 1) * 0.25, c: "var(--bad)", t: fmt.num((fifoPos - 1) * 0.25, 2) + " s" }, { l: "WFQ wait", v: (pos - 1) * 0.25, c: "var(--good)", t: fmt.num((pos - 1) * 0.25, 2) + " s" }]), LIA.caption("assuming 0.25 s per request ahead (mocked)")),
+        note: `Fair queueing moves our request from position ${fifoPos} to ${pos}.`,
+      },
+      {
+        k: "Settle", op: "charge actual, refund rest", where: "rate limiter",
+        input: () => div(LIA.tokens(M.output, { cls: () => "out" }), LIA.kv([["actual tokens", `${PROMPT_N()} + ${OUT_N()} = ${actual}`]])),
+        output: () => LIA.kv([["reserved", String(est)], ["refund", `${est} − ${actual} = ${est - actual}`], ["bucket now", fmt.num(bucket - actual)]]),
+        note: "Refunding unused reservation keeps short answers from eating a tenant's quota.",
+      },
+    ];
+  };
+
+  /* ---------- Q24: what this request costs, lever by lever ---------- */
+  TRACES.q24 = (M) => {
+    const n = PROMPT_N() + OUT_N();
+    const base = 2.0; // $ per 1M tokens, same baseline as the lab
+    const sys = 12; // tokens 0..11 are the shared system prompt
+    const levers = [
+      { k: "Continuous batching", m: 0.5, why: "more sequences share each weight read" },
+      { k: "FP8 weights + KV", m: 0.6, why: "half the bytes per step" },
+      { k: "Prefix cache hit", m: (n - sys) / n, why: `${sys} system-prompt tokens skip prefill` },
+      { k: "Route to 8B model", m: 0.15, why: "classifier: short factual question (mocked)" },
+      { k: "Spot capacity", m: 0.65, why: "cheaper GPU-hours with on-demand fallback" },
+    ];
+    const per1M = (c) => c * 1e6; // $ for 1M requests like this one
+    let cost = (n * base) / 1e6;
+    const costs = [cost];
+    levers.forEach((l) => { cost *= l.m; costs.push(cost); });
+    const waterfall = (upto) => {
+      const W = 380, H = 142, bw = W / (levers.length + 1);
+      const sv = LIA.svg(W, H);
+      const Y = (v) => 110 - (v / costs[0]) * 96;
+      costs.forEach((c, i) => {
+        const prev = i ? costs[i - 1] : 0;
+        const on = i <= upto;
+        if (i === 0) sv.appendChild(s("rect", { x: 2, y: Y(c), width: bw - 6, height: 110 - Y(c), rx: 2, fill: "var(--hbm)", opacity: on ? 1 : 0.25 }));
+        else sv.appendChild(s("rect", { x: i * bw + 2, y: Y(prev), width: bw - 6, height: Y(c) - Y(prev), rx: 2, fill: "var(--good)", opacity: on ? 0.9 : 0.15 }));
+        if (on) sv.appendChild(s("text", { x: i * bw + bw / 2 - 2, y: i ? Y(c) + 12 : Y(c) - 3, "text-anchor": "middle", "font-size": 10, fill: "var(--ink)" }, "$" + fmt.num(per1M(c), 2)));
+        sv.appendChild(s("text", { x: i * bw + bw / 2 - 2, y: 136, "text-anchor": "middle", "font-size": 9.5, fill: "var(--muted)" }, i ? "×" + fmt.num(levers[i - 1].m, 2) : "base"));
+      });
+      return sv;
+    };
+    const steps = [
+      {
+        k: "Baseline", op: `${n} tokens × $${base.toFixed(2)} / 1M`, where: "70B · FP16 · static batching",
+        input: () => div(LIA.tokens(M.prompt.concat(M.output), { ids: false, cls: (t, i) => (i >= PROMPT_N() ? "out" : "") }), LIA.caption(`${PROMPT_N()} prompt + ${OUT_N()} output = ${n} tokens`)),
+        output: () => div(waterfall(0), LIA.kv([["this request", "$" + costs[0].toFixed(7)], ["per 1M such requests", "$" + fmt.num(per1M(costs[0]), 2)]])),
+        note: "Per-request cost is tiny, so the stepper shows dollars per million requests like this one. Every token is priced the same here for simplicity.",
+      },
+    ];
+    levers.forEach((l, i) => {
+      steps.push({
+        k: l.k, op: `× ${fmt.num(l.m, 3)}`, where: l.why,
+        input: () => (l.k === "Prefix cache hit"
+          ? div(LIA.tokens(M.prompt, { ids: false, cls: (t, j) => (j < sys ? "hit" : "") }), LIA.caption(`teal = served from prefix cache · (${n} − ${sys}) / ${n} = ${fmt.num(l.m, 3)}`))
+          : LIA.kv([["before", "$" + fmt.num(per1M(costs[i]), 2) + " / 1M req"], ["multiplier", "× " + fmt.num(l.m, 3)]])),
+        output: () => div(waterfall(i + 1), LIA.kv([["after", "$" + fmt.num(per1M(costs[i + 1]), 2) + " / 1M req"], ["cumulative cut", fmt.pct(1 - costs[i + 1] / costs[0], 1)]])),
+        note: i === 2
+          ? "Treating prompt tokens like output tokens overstates this saving: prefill tokens are cheaper than decode tokens in practice."
+          : i === 3 ? "Routing has the biggest multiplier, but only for requests a small model answers correctly. “Paris” qualifies; a code review would not." : "",
+      });
+    });
+    return steps;
+  };
+
+  /* ---------- Q25: the request through the whole system ---------- */
+  TRACES.q25 = (M) => {
+    const sys = 12;
+    const prefixKey = M.prompt.slice(0, sys).map((t) => t.id).join(",");
+    const ph = fnv1a(prefixKey);
+    const replicas = ["replica-0", "replica-1", "replica-2", "replica-3"];
+    const repAngles = replicas.map((r) => fmix(fnv1a(r)) % 360);
+    const keyAngle = fmix(ph) % 360;
+    const pick = (() => { const sorted = replicas.map((r, i) => ({ r, a: repAngles[i] })).sort((a, b) => a.a - b.a); return (sorted.find((x) => x.a >= keyAngle) || sorted[0]); })();
+    const kvBytes = PROMPT_N() * M.model.kvBytesPerToken;
+    const hops = [
+      { l: "gateway", ms: 4 }, { l: "auth", ms: 2 }, { l: "model router", ms: 3 }, { l: "cache router", ms: 1 }, { l: "queue", ms: 40 }, { l: "prefill", ms: 25 }, { l: "KV xfer", ms: kvBytes / 50e9 * 1000 }, { l: "decode ×8", ms: 8 * 25 },
+    ];
+    const budget = (upto) => {
+      const spent = hops.slice(0, upto + 1).reduce((a, b) => a + b.ms, 0);
+      const cols = ["var(--muted)", "var(--accent)", "var(--compute)", "var(--sram)", "var(--warn)", "var(--compute)", "var(--hbm)", "var(--hbm)"];
+      return div(splitBar(hops.map((hp, i) => ({ v: hp.ms, c: cols[i], o: i <= upto ? 0.9 : 0.12 })), { total: hops.reduce((a, b) => a + b.ms, 0), caption: `elapsed ${fmt.num(spent, 1)} ms` }));
+    };
+    const ring = () => {
+      const sv = LIA.svg(200, 190), cx = 100, cy = 92, r = 64;
+      sv.appendChild(s("circle", { cx, cy, r, fill: "none", stroke: "var(--line)", "stroke-width": 6 }));
+      const pt = (a, rr = r) => [cx + rr * Math.cos((a - 90) * Math.PI / 180), cy + rr * Math.sin((a - 90) * Math.PI / 180)];
+      replicas.forEach((rp, i) => { const [x, y] = pt(repAngles[i]); const [tx, ty] = pt(repAngles[i], r + 20); sv.appendChild(s("circle", { cx: x, cy: y, r: 7, fill: rp === pick.r ? "var(--sram)" : "var(--surface-2)", stroke: "var(--sram)", "stroke-width": 2 })); sv.appendChild(s("text", { x: tx, y: ty + 4, "text-anchor": "middle", "font-size": 10, fill: "var(--ink)" }, "r" + i)); });
+      const [kx, ky] = pt(keyAngle);
+      sv.appendChild(s("circle", { cx: kx, cy: ky, r: 5, fill: "var(--accent)" }));
+      sv.appendChild(s("text", { x: cx, y: cy + 4, "text-anchor": "middle", "font-size": 10, fill: "var(--muted)" }, `key @ ${keyAngle}°`));
+      sv.appendChild(s("text", { x: cx, y: 186, "text-anchor": "middle", "font-size": 10, fill: "var(--muted)" }, "clockwise to next replica"));
+      return sv;
+    };
+    return [
+      {
+        k: "Edge gateway", op: "TLS · HTTP/2 · request id", where: hops[0].ms + " ms",
+        input: () => LIA.blob(LIA.esc(JSON.stringify(M.request, null, 1))),
+        output: () => div(LIA.kv([["x-request-id", M.id], ["x-region", "us-east"], ["deadline", "TTFT ≤ 800 ms"]]), budget(0), mocked()),
+        note: "The gateway terminates TLS, assigns an id that every later hop logs, and attaches a latency budget.",
+      },
+      {
+        k: "Auth + rate limit", op: "key → tenant · token bucket", where: hops[1].ms + " ms",
+        input: () => LIA.kv([["Authorization", "Bearer sk-…9f2c"]]),
+        output: () => div(LIA.kv([["x-tenant", "acme-pro"], ["tier", "pro · weight 4"], ["bucket", "1,240 → 1,148 tokens"]]), budget(1)),
+        note: "Rejecting over-quota traffic here costs microseconds; rejecting it on a GPU would waste a prefill.",
+      },
+      {
+        k: "Model router", op: "pick model pool", where: hops[2].ms + " ms",
+        input: () => div(LIA.tokens(M.question, { ids: false }), LIA.kv([["prompt tokens", String(PROMPT_N())], ["requested", M.request.model]])),
+        output: () => div(LIA.kv([["classifier", "short factual (mocked)"], ["decision", "honor explicit model → llama-70b pool"]]), budget(2)),
+        note: "With no explicit model, a router could send this question to an 8B model and cut its cost by ~85% (see Q24).",
+      },
+      {
+        k: "Cache-aware router", op: "hash(prefix) → ring", where: hops[3].ms + " ms",
+        input: () => div(LIA.tokens(M.prompt, { max: 16, cls: (t, i) => (i < sys ? "hit" : "dim") }), LIA.kv([["prefix", `first ${sys} token ids`], ["hash", "fmix(fnv1a) = 0x" + hex(fmix(ph))]])),
+        output: () => div(ring(), LIA.kv([["chosen", pick.r]]), budget(3)),
+        note: "Every request with this system prompt hashes to the same replica, so its KV blocks are already cached there.",
+      },
+      {
+        k: "Prefill pool", op: `queue + prefill on ${pick.r}`, where: `${hops[4].ms + hops[5].ms} ms`,
+        input: () => LIA.tokens(M.prompt, { ids: false, cls: (t, i) => (i < sys ? "hit" : "hl") }),
+        output: () => div(LIA.kv([["cached (teal)", sys + " tokens"], ["computed", `${PROMPT_N() - sys} tokens`], ["KV written", `${PROMPT_N()} × 320 KiB = ${fmt.num(kvBytes / 2 ** 20, 2)} MiB`], ["first token", "“The”"]]), budget(5)),
+        note: `TTFT so far is ${fmt.num(hops.slice(0, 6).reduce((a, b) => a + b.ms, 0), 0)} ms, well inside the 800 ms budget.`,
+      },
+      {
+        k: "KV transfer", op: "RDMA to decode pool", where: fmt.num(hops[6].ms, 2) + " ms",
+        input: () => LIA.kv([["KV size", fmt.num(kvBytes / 2 ** 20, 2) + " MiB"], ["link", "400 Gb/s ≈ 50 GB/s"]]),
+        output: () => div(LIA.kv([["time", `${fmt.num(kvBytes / 1e6, 2)} MB ÷ 50 GB/s = ${fmt.num(hops[6].ms, 3)} ms`]]), budget(6)),
+        note: "For a 28-token prompt the hand-off is negligible. It only matters for long prompts (Q22).",
+      },
+      {
+        k: "Decode + stream", op: "8 steps × 25 ms TPOT", where: hops[7].ms + " ms",
+        input: () => LIA.tokens(M.output, { cls: () => "out" }),
+        output: () => div(LIA.blob(M.output.filter((t) => !t.sp).map((t) => `data: {"delta":"${LIA.esc(t.t)}"}`).join("\n") + "\ndata: [DONE]"), budget(7)),
+        note: "Each token goes back through the gateway as one SSE event on the same HTTP/2 stream.",
+      },
+      {
+        k: "Observe", op: "emit span + usage", where: "telemetry",
+        input: () => LIA.kv([["request", M.id], ["replica", pick.r]]),
+        output: () => LIA.kv([["TTFT", fmt.num(hops.slice(0, 6).reduce((a, b) => a + b.ms, 0), 0) + " ms"], ["TPOT", "25 ms"], ["tokens", `${PROMPT_N()} in / ${OUT_N()} out`], ["prefix hit", `${sys} / ${PROMPT_N()} tokens`], ["total", fmt.num(hops.reduce((a, b) => a + b.ms, 0), 0) + " ms"]]),
+        note: "One structured record per request feeds the dashboards, billing and the canary gates from Q19.",
+      },
+    ];
+  };
+
+  /* =====================================================================
    * Q19 — Safe rollouts
    * ===================================================================== */
   LIA.register({
@@ -222,6 +596,7 @@
       }
       reset();
     },
+    trace: TRACES.q19,
     insights: [
       { t: "Gate on quality, not just health.", d: "A bad quantization or chat-template change returns fast HTTP 200s full of garbage. Only an eval-score or user-feedback gate catches it." },
       { t: "Small canaries are statistically blind.", d: "At 1% traffic, p99 latency and eval scores are too noisy to judge. Use 1% to catch crashes, then decide at 5–25%." },
@@ -409,6 +784,7 @@
       }
       update();
     },
+    trace: TRACES.q20,
     insights: [
       { t: "GPU util is a poor scaling signal.", d: "LLM engines keep the GPU busy at moderate load, so util sits near 100% and cannot say how far over capacity you are. Watch scale-up crawl when you pick it." },
       { t: "Queue depth and KV usage lead the SLO.", d: "Waiting requests and KV-cache pressure rise before TTFT does. Queue depth also measures how much demand exceeds capacity." },
@@ -588,6 +964,7 @@
       }
       run();
     },
+    trace: TRACES.q21,
     insights: [
       { t: "FIFO lets one tenant hurt everyone.", d: "A burst from the free tier fills the shared queue and every customer behind it waits." },
       { t: "Strict priority starves the bottom tier.", d: "Turn on the enterprise surge: as long as higher tiers have work, Pro and Free get nothing." },
@@ -704,6 +1081,7 @@
       }
       draw();
     },
+    trace: TRACES.q24,
     insights: [
       { t: "Savings multiply.", d: "Three levers keeping 50%, 60% and 80% leave 0.5 × 0.6 × 0.8 = 24% of the cost, a 76% cut. Adding their percentages would claim 110%." },
       { t: "Batching and precision come first.", d: "Decode is bandwidth-bound; more sequences per weight read and fewer bytes per weight are the biggest multipliers." },
@@ -908,6 +1286,7 @@
       calc();
       LIA.onTheme(() => drawDiagram());
     },
+    trace: TRACES.q25,
     insights: [
       { t: "Size prefill and decode separately.", d: "Prefill scales with input tokens and compute; decode scales with output tokens and HBM bandwidth. They need different GPU counts." },
       { t: "Provision for the peak, pay for the average.", d: "Peak-to-average ratio drives fleet size. Autoscaling, spot capacity and batch workloads fill the troughs." },
