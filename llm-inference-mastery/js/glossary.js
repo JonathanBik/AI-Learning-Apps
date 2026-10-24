@@ -312,7 +312,8 @@
   function place() {
     if (!pop) return;
     const narrow = window.innerWidth < 640;
-    pop.classList.toggle("sheet", narrow || !popFor);
+    pop.classList.toggle("sheet", narrow);
+    pop.classList.toggle("center", !narrow && !popFor);
     if (narrow || !popFor) { pop.style.left = pop.style.top = ""; return; }
     const r = popFor.getBoundingClientRect(), pw = pop.offsetWidth, ph = pop.offsetHeight;
     let left = LIA.clamp(r.left + r.width / 2 - pw / 2, 12, window.innerWidth - pw - 12);
