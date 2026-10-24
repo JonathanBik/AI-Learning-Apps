@@ -78,6 +78,7 @@
 }
 
 * { box-sizing: border-box; }
+[hidden] { display: none !important; }
 html, body { height: 100%; }
 body {
   margin: 0;
@@ -370,3 +371,45 @@ textarea { width: 100%; resize: vertical; line-height: 1.5; }
 .blob .sp { color: var(--compute); }
 .blob .hl { color: var(--accent); font-weight: 600; }
 .blob .dim { color: var(--muted); }
+
+/* ---------- glossary: linked terms, explanation card, key-terms strip ---------- */
+.term {
+  display: inline; border: 0; padding: 0; margin: 0; background: none; font: inherit; color: inherit; cursor: help;
+  text-decoration: underline dotted var(--accent); text-decoration-thickness: 1.5px; text-underline-offset: 3px;
+}
+.term:hover, .term:focus-visible { color: var(--accent); background: var(--accent-soft); border-radius: 3px; }
+.gpop {
+  position: absolute; z-index: 50; width: min(380px, calc(100vw - 24px)); max-height: min(78vh, 640px); overflow-y: auto;
+  background: var(--surface); color: var(--ink); border: 1px solid var(--line); border-radius: 12px;
+  box-shadow: 0 10px 40px rgba(10, 14, 22, 0.28); padding: 16px 16px 14px; display: flex; flex-direction: column; gap: 10px; font-size: 14px;
+}
+.gpop.sheet {
+  position: fixed; left: 0; right: 0; bottom: 0; top: auto; width: auto; max-height: 82vh; border-radius: 14px 14px 0 0;
+  padding-bottom: max(14px, env(safe-area-inset-bottom, 0px));
+  padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px));
+}
+.gpop-x { position: absolute; top: 8px; right: 10px; border: 0; background: none; font-size: 22px; line-height: 1; cursor: pointer; color: var(--muted); }
+.gl-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; padding-right: 22px; }
+.gl-term { font: 700 17px var(--f-display); }
+.gl-short { font-weight: 500; }
+.gl-viz { background: var(--surface-2); border: 1px solid var(--line); border-radius: 8px; padding: 8px; overflow-x: auto; }
+.gl-viz svg { display: block; margin: 0 auto; }
+.gl-long { color: var(--ink); }
+.gl-an { color: var(--muted); font-size: 13.5px; }
+.gl-an b { color: var(--ink); }
+.gl-f { font-size: 12.5px; white-space: pre-wrap; }
+.gl-ex { font-size: 13.5px; background: var(--hbm-soft); border-radius: 7px; padding: 8px 10px; }
+.gl-rel { display: flex; flex-wrap: wrap; gap: 5px; align-items: center; }
+.gl-chip { cursor: pointer; }
+.kt-panel { padding-block: 12px; }
+.kt-chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.kt-chip { border: 1px solid var(--line); border-left-width: 3px; background: var(--surface-2); border-radius: 6px; padding: 4px 9px; font-size: 13px; cursor: pointer; }
+.kt-chip:hover { background: var(--accent-soft); }
+.kt-cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 10px; margin-top: 12px; }
+.kt-card {
+  text-align: left; display: flex; flex-direction: column; gap: 8px; border: 1px solid var(--line); border-radius: 10px;
+  background: var(--surface); padding: 12px; cursor: pointer; font-size: 13.5px; min-width: 0;
+}
+.kt-card:hover { border-color: var(--accent); }
+.kt-card .gl-term { font-size: 15px; }
+.kt-card .gl-viz { pointer-events: none; }

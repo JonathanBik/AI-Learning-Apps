@@ -33,7 +33,7 @@
     5: "Production Infrastructure & Capacity",
   };
   LIA.ORDER = [
-    "map",
+    "map", "glossary",
     "q1", "q3", "q4", "q5", "m1check",
     "q2", "q6", "q7", "q8", "q9", "q10",
     "q11", "q12", "q13", "q15",
@@ -43,6 +43,9 @@
   const topics = {};
   LIA.topics = topics;
   LIA.register = (t) => { topics[t.id] = t; };
+  /** extension points: afterShow(topic, articleEl) runs after a topic renders; afterTrace(el) after each worked-example step. */
+  LIA.hooks = { afterShow: [], afterTrace: [] };
+  const runHooks = (name, ...args) => LIA.hooks[name].forEach((f) => { try { f(...args); } catch (e) { console.error(e); } });
   LIA.reducedMotion = window.matchMedia && matchMedia("(prefers-reduced-motion: reduce)").matches;
 
   /* ---------------- DOM helpers ---------------- */
@@ -551,6 +554,7 @@
       );
       note.innerHTML = st.note || "";
       note.hidden = !st.note;
+      runHooks("afterTrace", el);
       prev.disabled = i === 0;
       next.disabled = i === steps.length - 1;
       count.textContent = `step ${i + 1} / ${steps.length}`;
@@ -750,6 +754,7 @@
     );
     LIA.clear(mainEl).appendChild(topic);
     try { t.render(stage); } catch (e) { console.error(e); stage.appendChild(h("div", { class: "caption" }, "This lab failed to load: " + e.message)); }
+    runHooks("afterShow", t, topic);
     refreshRail();
     if (railEl && window.innerWidth <= 860) {
       railEl.dataset.collapsed = "true";
