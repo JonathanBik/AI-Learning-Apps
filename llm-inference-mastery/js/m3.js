@@ -335,6 +335,7 @@
     lede: "Every format trades bits between range (exponent) and precision (mantissa); block scaling recovers what 4 bits alone cannot.",
     tags: [{ label: "FP8 · INT4 · NVFP4", kind: "compute" }, { label: "PTQ vs QAT", kind: "accent" }],
     render: renderQ11,
+    trace: traceQ11,
     insights: [
       { t: "Exponent buys range, mantissa buys precision.", d: "E4M3 tops out at 448 with 3 mantissa bits; E5M2 reaches 57,344 with only 2. Inference uses E4M3; E5M2 suits gradients." },
       { t: "Integers need a scale.", d: "INT8/INT4 grids are uniform, so one outlier stretches the scale and crushes every other value to a few levels. Smaller groups contain the damage." },
@@ -476,6 +477,7 @@
     lede: "Pick silicon by the binding constraint: HBM capacity decides how many GPUs, bandwidth caps decode speed, FLOPS caps prefill.",
     tags: [{ label: "H100 · H200 · B200 · L40S", kind: "accent" }, { label: "Roofline", kind: "hbm" }],
     render: renderQ12,
+    trace: traceQ12,
     insights: [
       { t: "Decode ceiling = bandwidth ÷ bytes per step.", d: "Every step reads all weights plus every active KV byte. tok/s per user ≤ BW / (weights + KV)." },
       { t: "Capacity sets the TP degree.", d: "Weights plus KV for all concurrent requests must fit in about 90% of HBM. H200/B200 let a 70B model run with fewer GPUs and more KV headroom." },
@@ -682,6 +684,7 @@
     lede: "Read an Nsight Systems timeline the way you'd read an ECG: gaps on the GPU row tell you who is starving it.",
     tags: [{ label: "Nsight Systems", kind: "accent" }, { label: "CUDA Graphs", kind: "compute" }, { label: "Debugging", kind: "warn" }],
     render: renderQ13,
+    trace: traceQ13,
     insights: [
       { t: "Start with Nsight Systems, then Nsight Compute.", d: "nsys shows <i>when</i> things run (CPU, API, kernels, copies). ncu explains <i>why</i> one kernel is slow (occupancy, memory throughput, stalls)." },
       { t: "Gaps between kernels = the CPU is the bottleneck.", d: "At decode batch 1, kernels last a few µs, about as long as launching them. CUDA Graphs replay the whole step with one launch." },
@@ -895,6 +898,7 @@ def rmsnorm_kernel(X, W, Y, stride, N, eps, BLOCK: tl.constexpr):
     lede: "RMSNorm does almost no math, so its cost is bytes moved. Fusion turns seven passes over HBM into two.",
     tags: [{ label: "Triton", kind: "compute" }, { label: "Kernel fusion", kind: "sram" }, { label: "Memory-bound", kind: "hbm" }],
     render: renderQ15,
+    trace: traceQ15,
     insights: [
       { t: "Arithmetic intensity ≈ 1 FLOP/byte.", d: "Far left of every roofline ridge. The only lever is moving fewer bytes and launching fewer kernels." },
       { t: "Fusion keeps intermediates in registers.", d: "x², the mean and the scaled tensor never hit HBM. Traffic drops from ~7·N·H to ~2·N·H elements, about 3.5× less." },
@@ -907,4 +911,447 @@ def rmsnorm_kernel(X, W, Y, stride, N, eps, BLOCK: tl.constexpr):
       { type: "mcq", prompt: "Why is BLOCK set to <code>next_power_of_2(H)</code> with a mask?", options: ["tl.arange requires a power-of-two length; the mask disables the out-of-range tail lanes", "To use more shared memory", "Powers of two avoid bank conflicts in HBM", "It is required for tl.rsqrt"], answer: 0, explain: "Triton block shapes must be powers of two. With BLOCK ≥ H, a whole row fits in one program for a single-pass reduction, and the mask makes loads and stores for cols ≥ H no-ops." },
     ],
   });
+  /* =====================================================================
+   * Worked examples: the shared mocked request (LIA.MOCK) through Module 3
+   * ===================================================================== */
+  const r3 = (v) => (Math.abs(v) < 1e-3 && v !== 0 ? v.toExponential(2) : (+v.toFixed(4)).toString());
+  const colsN = (n, p = "w") => Array.from({ length: n }, (_, i) => p + i);
+  const chunk2 = (arr) => [arr.slice(0, 8), arr.slice(8, 16)];
+  function e4m3Bits(x) { const n = fpNearest(E4M3, x); return (x < 0 ? "1" : "0") + " " + n.e.toString(2).padStart(4, "0") + " " + n.m.toString(2).padStart(3, "0"); }
+  function e2m1Bits(x) { const n = fpNearest(E2M1, x); return (x < 0 ? "1" : "0") + " " + n.e.toString(2).padStart(2, "0") + " " + n.m.toString(2); }
+  function int4Bits(q) { return (q & 0xf).toString(2).padStart(4, "0"); }
+  function bitsBlob(rows) {
+    return LIA.blob(rows.map((r) => `<span class="dim">${LIA.esc(r[0])}</span>  ${LIA.esc(r[1])}  <span class="hl">${LIA.esc(r[2])}</span>`).join("\n"));
+  }
+
+  /* ---------- Q11: quantize one 16-weight block three ways ---------- */
+  function traceQ11(M) {
+    const paris = M.output[5];
+    const W = LIA.toy.weights.Wq;
+    const w = [...W[0], ...W[1]]; // 16 consecutive weights (rows 0–1 of toy Wq), a single quantization block
+    const amax = Math.max(...w.map(Math.abs));
+    // FP8 E4M3, per-tensor scale
+    const s8 = amax / 448;
+    const q8 = w.map((v) => fpQ(E4M3, v / s8));
+    const d8 = q8.map((q) => q * s8);
+    // INT4 symmetric, group of 16
+    const s4 = amax / 7;
+    const q4 = w.map((v) => LIA.clamp(Math.round(v / s4), -8, 7));
+    const d4 = q4.map((q) => q * s4);
+    // NVFP4: FP32 per-tensor scale + E4M3 per-16 block scale + E2M1 elements
+    const sT = amax / (448 * 6);
+    const sB = fpQ(E4M3, amax / 6 / sT);
+    const eff = sB * sT;
+    const qN = w.map((v) => fpQ(E2M1, v / eff));
+    const dN = qN.map((q) => q * eff);
+    const err = (d) => d.map((v, i) => v - w[i]);
+    const mse = (d) => err(d).reduce((a, e) => a + e * e, 0) / d.length;
+    const x = LIA.toy.embed([paris])[0];
+    const dot = (wr) => x.reduce((a, v, i) => a + v * wr[i], 0);
+    const yRef = dot(w.slice(0, 8)), y8 = dot(d8.slice(0, 8)), y4 = dot(d4.slice(0, 8)), yN = dot(dN.slice(0, 8));
+    const m2 = (arr, o = {}) => LIA.matrix(chunk2(arr), Object.assign({ rows: ["w0–7", "w8–15"], d: 3, diverge: true, color: "var(--compute)", neg: "var(--hbm)" }, o));
+
+    function errChart() {
+      const Wd = 620, Hd = 170, padL = 34, bw = (Wd - padL - 6) / 16;
+      const sets = [{ d: d8, c: "var(--sram)", k: "FP8 E4M3" }, { d: d4, c: "var(--hbm)", k: "INT4 g16" }, { d: dN, c: "var(--compute)", k: "NVFP4" }];
+      const emax = Math.max(...sets.flatMap((st) => err(st.d).map(Math.abs)), 1e-6);
+      const svg = LIA.svg(Wd, Hd, { "aria-label": "Per-element quantization error" });
+      const base = Hd - 22;
+      svg.appendChild(s("line", { x1: padL, x2: Wd - 4, y1: base, y2: base, stroke: "var(--line)" }));
+      svg.appendChild(s("text", { x: padL - 4, y: 26, "text-anchor": "end", "font-size": 10, fill: "var(--muted)" }, emax.toFixed(3)));
+      svg.appendChild(s("text", { x: padL - 4, y: base, "text-anchor": "end", "font-size": 10, fill: "var(--muted)" }, "0"));
+      for (let i = 0; i < 16; i++) {
+        sets.forEach((st, k) => {
+          const e = Math.abs(st.d[i] - w[i]);
+          const hh = (e / emax) * (base - 22);
+          svg.appendChild(s("rect", { x: padL + i * bw + 2 + k * ((bw - 4) / 3), y: base - hh, width: (bw - 4) / 3 - 1, height: Math.max(hh, 0.5), fill: st.c }));
+        });
+        svg.appendChild(s("text", { x: padL + i * bw + bw / 2, y: Hd - 8, "text-anchor": "middle", "font-size": 9.5, fill: "var(--muted)" }, i));
+      }
+      sets.forEach((st, k) => {
+        svg.appendChild(s("rect", { x: padL + k * 150, y: 4, width: 10, height: 10, fill: st.c }));
+        svg.appendChild(s("text", { x: padL + 14 + k * 150, y: 13, "font-size": 11, fill: "var(--ink)" }, `${st.k} · MSE ${mse(st.d).toExponential(1)}`));
+      });
+      return LIA.viz(svg);
+    }
+
+    return [
+      {
+        k: "Pick a block",
+        op: "slice 16 weights",
+        where: "offline · quantizer",
+        inLabel: "Toy Wq (8×8, mocked weights)",
+        input: () => LIA.matrix(W, { d: 2, diverge: true, highlight: (i) => i < 2, caption: "seeded random toy weights; rows 0–1 highlighted" }),
+        outLabel: "One 16-element block (BF16)",
+        output: () => h("div", { class: "stage", style: { gap: "8px" } }, m2(w), LIA.kv([["absmax", r3(amax)], ["bytes in BF16", "16 × 2 B = 32 B"]])),
+        note: "Quantization works on blocks: one scale is shared by a group of neighbouring weights. Everything below uses these exact 16 numbers.",
+      },
+      {
+        k: "FP8 E4M3",
+        op: "x / s → E4M3",
+        where: "per-tensor scale",
+        inLabel: "Scale",
+        input: () => LIA.formula(`s = absmax / 448\n  = ${r3(amax)} / 448\n  = <span class="hl">${s8.toExponential(3)}</span>\n\nw0 / s = ${r3(w[0] / s8)}`),
+        outLabel: "Codes (S EEEE MMM) → value",
+        output: () => h("div", { class: "stage", style: { gap: "8px" } },
+          bitsBlob(w.slice(0, 5).map((v, i) => [`w${i} ${v >= 0 ? " " : ""}${v.toFixed(2)}`, e4m3Bits(v / s8), `→ ${r3(q8[i])} × s = ${r3(d8[i])}`])),
+          LIA.caption("first 5 of 16 shown · 8 bits each = 16 B total")),
+        note: "E4M3 has 3 mantissa bits, so values near the top of the range land on a grid about 6% apart. The scale maps absmax onto 448, the largest E4M3 value.",
+      },
+      {
+        k: "INT4 per group",
+        op: "round(x / s), clamp [−8, 7]",
+        where: "group of 16 · FP16 scale",
+        inLabel: "Scale",
+        input: () => LIA.formula(`s = absmax / 7\n  = ${r3(amax)} / 7\n  = <span class="hl">${r3(s4)}</span>`),
+        outLabel: "Integer codes (two's complement)",
+        output: () => h("div", { class: "stage", style: { gap: "8px" } },
+          LIA.matrix(chunk2(q4), { rows: ["q0–7", "q8–15"], d: 0, diverge: true, max: 8 }),
+          bitsBlob(q4.slice(0, 4).map((q, i) => [`q${i} ${q >= 0 ? " " : ""}${q}`, int4Bits(q), `→ ${r3(q * s4)}`]))),
+        note: "Only 16 evenly spaced levels. Small weights collapse to 0 or ±1 step, which is where most INT4 error comes from.",
+      },
+      {
+        k: "NVFP4 two-level",
+        op: "E4M3 block scale + E2M1",
+        where: "Blackwell FP4 tensor cores",
+        inLabel: "Scales",
+        input: () => LIA.formula(`s_T   = amax / (448·6)        = ${sT.toExponential(3)}  <span class="dim">FP32, per tensor</span>\ns_blk = E4M3(amax / 6 / s_T)  = <span class="hl">${r3(sB)}</span>  <span class="dim">FP8, per 16</span>\nstep  = s_blk · s_T           = ${r3(eff)}`),
+        outLabel: "E2M1 codes (S EE M) → value",
+        output: () => h("div", { class: "stage", style: { gap: "8px" } },
+          LIA.matrix(chunk2(qN), { rows: ["c0–7", "c8–15"], d: 1, diverge: true, max: 6 }),
+          bitsBlob(w.slice(0, 4).map((v, i) => [`w${i} ${v >= 0 ? " " : ""}${v.toFixed(2)}`, e2m1Bits(v / eff), `→ ${qN[i]} → ${r3(dN[i])}`]))),
+        note: "E2M1 can only say 0, 0.5, 1, 1.5, 2, 3, 4 or 6. The FP8 block scale stretches that grid to fit each block of 16.",
+      },
+      {
+        k: "Dequantize & compare",
+        op: "x̂ = code · scale",
+        where: "inside the GEMM",
+        inLabel: "Original block",
+        input: () => m2(w),
+        outLabel: "|error| per weight",
+        output: errChart,
+        note: "Same 16 weights, three formats. Watch INT4 and NVFP4 diverge on the small weights, where the coarse grid rounds hardest.",
+      },
+      {
+        k: "Effect on one output",
+        op: "y = x_Paris · w",
+        where: "8-wide dot product",
+        inLabel: `Toy hidden state of “${LIA.showTok(paris.t)}”`,
+        input: () => h("div", { class: "stage", style: { gap: "8px" } }, LIA.tokens([paris], { cls: () => "out" }), LIA.matrix([x], { cols: colsN(8, "x"), d: 2, diverge: true })),
+        outLabel: "y and its error per format",
+        output: () => h("div", { class: "stage", style: { gap: "8px" } },
+          LIA.kv([["BF16 (reference)", r3(yRef)], ["FP8 E4M3", r3(y8)], ["INT4 g16", r3(y4)], ["NVFP4", r3(yN)]]),
+          LIA.hbar({ width: 380, labelW: 90, valW: 90, rowH: 24, fmt: (v) => "Δ " + r3(v),
+            rows: [["FP8 E4M3", y8, "var(--sram)"], ["INT4 g16", y4, "var(--hbm)"], ["NVFP4", yN, "var(--compute)"]].map(([l, v, c]) => ({ label: l, value: Math.abs(v - yRef), color: c })) })),
+        note: "This toy y sums only 8 terms and sits near zero, so 4-bit errors look large. Real layers sum 8,192 terms where errors partly cancel; outliers that don't cancel are what hurt, which is why AWQ and GPTQ protect them.",
+      },
+      {
+        k: "Bytes for the whole model",
+        op: "bits / param × 70.6B",
+        where: "HBM footprint",
+        inLabel: "This block",
+        input: () => LIA.kv([["BF16", "32 B"], ["FP8", "16 B (+ 1 shared scale)"], ["INT4 g16", "8 B + 2 B scale = 5 bits/w"], ["NVFP4", "8 B + 1 B scale = 4.5 bits/w"]]),
+        outLabel: `${M.model.name} weights`,
+        output: () => LIA.hbar({ width: 380, labelW: 90, valW: 70, rowH: 26, fmt: (v) => fmt.num(v, 0) + " GB",
+          rows: [["BF16", 16, "var(--ink)"], ["FP8", 8, "var(--sram)"], ["INT4 g16", 5, "var(--hbm)"], ["NVFP4", 4.5, "var(--compute)"]].map(([l, b, c]) => ({ label: l, value: (M.model.params * b) / 8 / 1e9, color: c })) }),
+        note: "Fewer weight bytes means fewer bytes to stream every decode step, so 4-bit weights speed up memory-bound decode as well as saving HBM.",
+      },
+    ];
+  }
+
+  /* ---------- Q12: this request on each GPU ---------- */
+  function traceQ12(M) {
+    const P = M.model.params, Wb = P * 2;
+    const nP = M.prompt.length, nO = M.output.length, nT = nP + nO;
+    const kvTok = M.model.kvBytesPerToken, kvReq = kvTok * nT;
+    const rows = GPUS.map((g) => {
+      const n = Math.ceil(Wb / (g.mem * 1e9 * 0.9));
+      const bw = g.bw * 1e12 * n, fl = g.bf16 * 1e12 * n;
+      const preC = (2 * P * nP) / fl, preM = Wb / bw;
+      const pre = Math.max(preC, preM);
+      const dec = (Wb + kvReq) / bw;
+      return { g, n, bw, fl, preC, preM, pre, dec, total: pre + (nO - 1) * dec };
+    });
+    const ms = (v) => fmt.num(v * 1000, v < 0.01 ? 2 : 1) + " ms";
+    const bar = (key, f, o = {}) => LIA.hbar(Object.assign({ width: 380, labelW: 70, valW: 110, rowH: 26, rows: rows.map((r) => ({ label: `${r.n}× ${r.g.id}`, value: r[key], color: r.g.color, note: f(r) })) }, o));
+    return [
+      {
+        k: "The request",
+        op: "count tokens",
+        where: "API server",
+        inLabel: "Prompt + generated answer",
+        input: () => h("div", { class: "stage", style: { gap: "6px" } }, LIA.tokens(M.prompt, { ids: false }), LIA.tokens(M.output, { ids: false, cls: () => "out" })),
+        outLabel: "Sizing inputs",
+        output: () => LIA.kv([["model", `${M.model.name} · BF16`], ["prompt tokens", nP], ["output tokens", nO], ["total context", nT], ["weights", fmt.bytes(Wb)]]),
+        note: "A short chat turn: 28 prompt tokens in, 8 tokens out. Small requests like this are typical, and they behave very differently from the 32K-token stress case.",
+      },
+      {
+        k: "Its KV cache",
+        op: "tokens × 327,680 B",
+        where: "2·L·H_kv·d·2 B",
+        inLabel: "Per token",
+        input: () => LIA.formula(`2 × ${M.model.L} × ${M.model.Hkv} × ${M.model.dHead} × 2 B\n= <span class="hbm">${fmt.num(kvTok)} B</span> per token`),
+        outLabel: "This request",
+        output: () => h("div", { class: "stage", style: { gap: "8px" } }, LIA.formula(`${nT} tokens × ${fmt.num(kvTok)} B\n= <span class="hbm">${fmt.num(kvReq)} B ≈ ${fmt.bytes(kvReq)}</span>`), LIA.caption(`That is ${(kvReq / Wb * 100).toFixed(4)}% of the weights. For a single short request, weights dominate everything.`)),
+        note: "KV memory only becomes the constraint when you multiply by long contexts and many users (see Q3).",
+      },
+      {
+        k: "GPUs for the weights",
+        op: "⌈weights / (0.9 · HBM)⌉",
+        where: "capacity check",
+        inLabel: "HBM per GPU",
+        input: () => LIA.kv(GPUS.map((g) => [g.id, `${g.mem} GB · ${g.bw} TB/s`])),
+        outLabel: "Minimum GPUs (BF16)",
+        output: () => bar("n", (r) => `${r.n} GPU${r.n > 1 ? "s" : ""} · ${fmt.num(r.n * r.g.mem)} GB`, { fmt: (v) => v }),
+        note: "Capacity decides the GPU count before speed is even considered. 141 GB of BF16 weights fit on one B200, but need 4 L40S cards.",
+      },
+      {
+        k: "Prefill 28 tokens",
+        op: "max(FLOPs/peak, bytes/BW)",
+        where: "roofline",
+        inLabel: "Work",
+        input: () => LIA.formula(`FLOPs = 2 · P · ${nP} = <span class="cmp">${fmt.si(2 * P * nP, 2)}</span>\nbytes ≈ weights   = <span class="hbm">${fmt.bytes(Wb)}</span>\nintensity ≈ ${nP} FLOP/B  <span class="dim">(ridge ≈ 295)</span>`),
+        outLabel: "Prefill time = TTFT floor",
+        output: () => h("div", { class: "stage", style: { gap: "8px" } }, bar("pre", (r) => `${ms(r.pre)} · ${r.preM > r.preC ? "BW" : "FLOPs"}`), LIA.caption(`compute alone would take only ${rows.map((r) => r.g.id + " " + ms(r.preC)).join(" · ")}`)),
+        note: "A 28-token prompt is far below the ridge point, so even prefill is bandwidth-bound here. Prefill only becomes compute-bound past a few hundred tokens.",
+      },
+      {
+        k: "Decode “Paris”",
+        op: "(weights + KV) / BW",
+        where: "one step",
+        inLabel: "Bytes per decode step",
+        input: () => h("div", { class: "stage", style: { gap: "8px" } }, LIA.tokens(M.output.slice(0, 6), { cls: (t, i) => (i === 5 ? "out" : "") }), LIA.formula(`${fmt.bytes(Wb)} + ${fmt.bytes(kvReq)} KV\n≈ <span class="hbm">${fmt.bytes(Wb + kvReq)}</span> per token`)),
+        outLabel: "TPOT bound",
+        output: () => bar("dec", (r) => `${ms(r.dec)} · ${fmt.num(1 / r.dec, 0)} tok/s`),
+        note: "Every new token streams all 141 GB again, so aggregate HBM bandwidth sets TPOT directly.",
+      },
+      {
+        k: "Whole request",
+        op: "TTFT + 7 × TPOT",
+        where: "end-to-end",
+        inLabel: "Timeline",
+        input: () => LIA.formula(`token 1 ← prefill\ntokens 2–8 ← 7 decode steps`),
+        outLabel: "Latency to “.<|eot_id|>”",
+        output: () => bar("total", (r) => ms(r.total)),
+        note: "B200 wins on latency through bandwidth alone. The L40S needs 4 cards and is still slowest, because GDDR6 is about 4× slower than HBM3.",
+      },
+      {
+        k: "Batch 64 of them",
+        op: "share each weight read",
+        where: "continuous batching",
+        inLabel: "Step bytes, batch 64",
+        input: () => LIA.formula(`weights ${fmt.bytes(Wb)} (once)\n+ KV 64 × ${fmt.bytes(kvReq)} = ${fmt.bytes(64 * kvReq)}`),
+        outLabel: "Throughput per node",
+        output: () => LIA.hbar({ width: 380, labelW: 70, valW: 110, rowH: 26, rows: rows.map((r) => { const st = (Wb + 64 * kvReq) / r.bw; return { label: `${r.n}× ${r.g.id}`, value: 64 / st, color: r.g.color, note: `${fmt.num(64 / st, 0)} tok/s` }; }) }),
+        note: "64 requests cost barely more per step than one, so throughput rises about 60×. This is why cost per token depends so heavily on batch size.",
+      },
+    ];
+  }
+
+  /* ---------- Q13: one decode step as kernel launches (mocked µs) ---------- */
+  function traceQ13(M) {
+    const LAYER = [
+      ["rmsnorm", 3], ["qkv_gemm", 9], ["rope", 2], ["paged_attn", 6], ["o_proj", 5], ["all_reduce", 8],
+      ["rmsnorm", 3], ["gate_up_gemm", 18], ["silu_mul", 2], ["down_gemm", 10], ["all_reduce", 8],
+    ];
+    const LAUNCH = 12; // µs of eager PyTorch + cudaLaunchKernel per op (mocked)
+    const gpuLayer = LAYER.reduce((a, k) => a + k[1], 0);
+    const L = M.model.L;
+    // eager: each kernel starts when both its launch finished and the previous kernel finished
+    function sched(eager) {
+      let cpu = 0, gpu = 0;
+      const out = [];
+      LAYER.forEach(([name, d]) => {
+        let ready;
+        if (eager) { cpu += LAUNCH; ready = cpu; } else ready = 0;
+        const st = Math.max(ready, gpu);
+        gpu = st + d;
+        out.push({ name, d, cpuEnd: eager ? cpu : 0, st, en: gpu });
+      });
+      return { out, end: gpu, cpu };
+    }
+    const eg = sched(true), gr = sched(false);
+    const eagerStep = L * Math.max(eg.end, eg.cpu) + 40, graphStep = 20 + L * gpuLayer + 40;
+    function timeline(sc, eager) {
+      const Wd = 480, Hd = 112, x0 = 62;
+      const total = Math.max(eg.end, eg.cpu, 140);
+      const X = (u) => x0 + (u / total) * (Wd - x0 - 8);
+      const svg = LIA.svg(Wd, Hd, { "aria-label": "Kernel timeline for one layer" });
+      svg.appendChild(s("text", { x: 4, y: 30, "font-size": 12, fill: "var(--muted)" }, eager ? "CPU" : "CPU"));
+      svg.appendChild(s("text", { x: 4, y: 64, "font-size": 12, fill: "var(--muted)" }, "GPU"));
+      if (eager) sc.out.forEach((k) => svg.appendChild(s("rect", { x: X(k.cpuEnd - LAUNCH) + 0.5, y: 18, width: X(LAUNCH) - x0 - 1, height: 18, rx: 2, fill: "var(--muted)", opacity: 0.55 })));
+      else svg.appendChild(s("rect", { x: X(0), y: 18, width: 6, height: 18, rx: 2, fill: "var(--accent)" }));
+      sc.out.forEach((k, i) => {
+        svg.appendChild(s("rect", { x: X(k.st) + 0.5, y: 52, width: Math.max(X(k.en) - X(k.st) - 1, 1), height: 18, rx: 2, fill: k.name === "all_reduce" ? "var(--sram)" : "var(--compute)" }));
+        if (i > 0 && k.st > sc.out[i - 1].en + 0.01) svg.appendChild(s("rect", { x: X(sc.out[i - 1].en), y: 52, width: X(k.st) - X(sc.out[i - 1].en), height: 18, fill: "var(--bad)", opacity: 0.25 }));
+      });
+      [0, 50, 100].forEach((u) => { if (u <= total) { svg.appendChild(s("line", { x1: X(u), x2: X(u), y1: 76, y2: 82, stroke: "var(--line)" })); svg.appendChild(s("text", { x: X(u), y: 94, "text-anchor": "middle", "font-size": 11.5, fill: "var(--muted)" }, u + " µs")); } });
+      svg.appendChild(s("text", { x: Wd - 8, y: 108, "text-anchor": "end", "font-size": 12, fill: "var(--ink)" }, `layer = ${Math.round(Math.max(sc.end, sc.cpu))} µs · GPU busy ${Math.round((gpuLayer / Math.max(sc.end, sc.cpu)) * 100)}%`));
+      return LIA.viz(svg);
+    }
+    const prev = M.output[4], next = M.output[5];
+    return [
+      {
+        k: "Schedule the step",
+        op: "build batch metadata",
+        where: "CPU · scheduler",
+        inLabel: "State before step 6",
+        input: () => h("div", { class: "stage", style: { gap: "6px" } }, LIA.tokens(M.output.slice(0, 5), { cls: (t, i) => (i === 4 ? "hl" : "out") }), LIA.caption(`last token “${LIA.showTok(prev.t)}” · KV holds ${M.prompt.length + 4} tokens`)),
+        outLabel: "Tensors for the GPU",
+        output: () => LIA.blob(`input_ids     = [<span class="hl">${prev.id}</span>]\npositions     = [${M.prompt.length + 4}]\nblock_table   = [[17, 4, 92]]   <span class="dim"># 16-token blocks</span>\nslot_mapping  = [${92 * 16 + ((M.prompt.length + 4) % 16)}]\nseq_lens      = [${M.prompt.length + 5}]`),
+        note: "The scheduler only decides which tokens to run; the GPU needs these few small tensors to run the step. Block numbers here are mocked.",
+      },
+      {
+        k: "Copy to GPU",
+        op: "H2D memcpy",
+        where: "PCIe",
+        inLabel: "Host buffers · mocked timings",
+        input: () => LIA.kv([["pageable", "staged through a bounce buffer, synchronous ≈ 10 µs each"], ["pinned + async", "DMA straight from host memory, overlaps ≈ 2 µs"]]),
+        outLabel: "Cost for 5 tiny tensors",
+        output: () => LIA.hbar({ width: 380, labelW: 110, valW: 70, rowH: 26, fmt: (v) => v + " µs", rows: [{ label: "pageable", value: 50, color: "var(--bad)" }, { label: "pinned async", value: 10, color: "var(--good)" }] }),
+        note: "A few dozen bytes still pay fixed latency per copy. Pinned memory plus one batched async copy removes the stall.",
+      },
+      {
+        k: "One layer, eager",
+        op: `${LAYER.length} kernel launches`,
+        where: "PyTorch eager · TP=8",
+        inLabel: "Kernels in layer 0 · mocked timings",
+        input: () => LIA.kv(LAYER.map(([n, d]) => [n, d + " µs"])),
+        outLabel: "Nsight-style timeline",
+        output: () => timeline(eg, true),
+        note: `Each launch costs ~${LAUNCH} µs on the CPU, but most kernels finish faster than that. The red gaps are the GPU waiting for the CPU.`,
+      },
+      {
+        k: "× 80 layers",
+        op: "repeat per layer",
+        where: "full forward pass",
+        inLabel: "Per layer",
+        input: () => LIA.kv([["CPU launch time", `${LAYER.length} × ${LAUNCH} = ${LAYER.length * LAUNCH} µs`], ["GPU kernel time", `${gpuLayer} µs`]]),
+        outLabel: "Per decode step",
+        output: () => LIA.hbar({ width: 380, labelW: 110, valW: 90, rowH: 26, fmt: (v) => fmt.num(v / 1000, 2) + " ms", rows: [{ label: "CPU launches", value: L * LAYER.length * LAUNCH, color: "var(--muted)" }, { label: "GPU kernels", value: L * gpuLayer, color: "var(--compute)" }] }),
+        note: `${L * LAYER.length} launches per token. The CPU side takes longer than the GPU work, so the step is CPU-bound.`,
+      },
+      {
+        k: "CUDA Graph replay",
+        op: "cudaGraphLaunch × 1",
+        where: "captured once at startup",
+        inLabel: "Same kernels, recorded",
+        input: () => LIA.caption(`All ${L * LAYER.length} kernels and their arguments are captured into one graph per batch size. Replay is a single launch.`),
+        outLabel: "Timeline after the fix",
+        output: () => timeline(gr, false),
+        note: "With launch overhead gone, kernels run back to back. The step is now limited by GPU time, which is mostly weight reads.",
+      },
+      {
+        k: "Sample & sync",
+        op: "top-p → .item()",
+        where: "GPU → CPU",
+        inLabel: "Logits [1 × 128,256]",
+        input: () => LIA.tokens([next, ...M.candidates.slice(1, 4)], { cls: (t, i) => (i === 0 ? "out" : "dim") }),
+        outLabel: "Next token",
+        output: () => h("div", { class: "stage", style: { gap: "6px" } }, LIA.tokens([next], { cls: () => "out" }), LIA.caption("4-byte D2H copy forces a sync: the CPU can't schedule step 7 until it knows this token (unless it overlaps scheduling)")),
+        note: "The token ID must reach the CPU for detokenizing and stop checks. Overlapped schedulers prepare step 7 while step 6 is still running.",
+      },
+      {
+        k: "Result",
+        op: "compare TPOT",
+        where: "per output token",
+        inLabel: "Step time (mocked)",
+        input: () => LIA.kv([["eager", fmt.num(eagerStep / 1000, 2) + " ms"], ["CUDA Graph", fmt.num(graphStep / 1000, 2) + " ms"]]),
+        outLabel: "Tokens / s for this request",
+        output: () => LIA.hbar({ width: 380, labelW: 100, valW: 90, rowH: 26, fmt: (v) => fmt.num(v, 0) + " tok/s", rows: [{ label: "eager", value: 1e6 / eagerStep, color: "var(--bad)" }, { label: "CUDA Graph", value: 1e6 / graphStep, color: "var(--good)" }] }),
+        note: `Same math, ${(eagerStep / graphStep).toFixed(1)}× faster. At batch 1, launch overhead is often the biggest single fix.`,
+      },
+    ];
+  }
+
+  /* ---------- Q15: RMSNorm on the toy hidden state of " Paris" ---------- */
+  function traceQ15(M) {
+    const paris = M.output[5];
+    const x = LIA.toy.embed([paris])[0];
+    const g = LIA.rng(77);
+    const gamma = x.map(() => +(0.8 + g() * 0.4).toFixed(2));
+    const eps = 1e-5;
+    const sq = x.map((v) => v * v);
+    const ms = sq.reduce((a, b) => a + b, 0) / x.length;
+    const rstd = 1 / Math.sqrt(ms + eps);
+    const xn = x.map((v) => v * rstd);
+    const y = xn.map((v, i) => v * gamma[i]);
+    const cols = colsN(8, "");
+    const row = (arr, o = {}) => LIA.matrix([arr], Object.assign({ cols, d: 3, diverge: true }, o));
+    const loc = (sram) => h("div", { class: "row", style: { gap: "6px" } }, LIA.pill(sram ? "in SRAM / registers" : "in HBM", sram ? "sram" : "hbm"));
+    const H = M.model.dModel;
+    const unfusedB = 7 * H * 2, fusedB = 2 * H * 2;
+    return [
+      {
+        k: "Load the row",
+        op: "tl.load(x_ptr + cols)",
+        where: "HBM → SRAM · 1 read",
+        inLabel: `Hidden state of “${LIA.showTok(paris.t)}” (toy, d=8)`,
+        input: () => h("div", { class: "stage", style: { gap: "8px" } }, LIA.tokens([paris], { cls: () => "out" }), row(x), loc(false)),
+        outLabel: "x (upcast to fp32)",
+        output: () => h("div", { class: "stage", style: { gap: "8px" } }, row(x), loc(true)),
+        note: "One program handles one token's row. This is the only time x is read from HBM.",
+      },
+      {
+        k: "Square",
+        op: "x * x",
+        where: "registers",
+        inLabel: "x",
+        input: () => row(x),
+        outLabel: "x²",
+        output: () => h("div", { class: "stage", style: { gap: "8px" } }, row(sq, { color: "var(--sram)" }), loc(true)),
+        note: "Elementwise and free: the values never leave the chip.",
+      },
+      {
+        k: "Mean",
+        op: "tl.sum(x²) / H",
+        where: "fp32 reduction",
+        inLabel: "x²",
+        input: () => row(sq, { color: "var(--sram)" }),
+        outLabel: "mean square",
+        output: () => LIA.formula(`(${sq.map((v) => v.toFixed(3)).join(" + ")}) / 8\n= <span class="hl">${ms.toFixed(5)}</span>`),
+        note: "The sum is accumulated in fp32. At real width (8,192) an fp16 sum could overflow.",
+      },
+      {
+        k: "+ eps, rsqrt",
+        op: "1 / √(ms + ε)",
+        where: "one scalar",
+        inLabel: "mean square",
+        input: () => LIA.formula(`ms = ${ms.toFixed(5)}\nε  = 1e-5`),
+        outLabel: "rstd",
+        output: () => LIA.formula(`rstd = 1 / √(${(ms + eps).toFixed(5)})\n     = <span class="hl">${rstd.toFixed(5)}</span>`),
+        note: "ε guards against dividing by zero for an all-zero row. The unfused version launches a whole kernel just for this scalar.",
+      },
+      {
+        k: "Normalize",
+        op: "x · rstd",
+        where: "registers",
+        inLabel: "x",
+        input: () => row(x),
+        outLabel: "x̂ (RMS = 1)",
+        output: () => h("div", { class: "stage", style: { gap: "8px" } }, row(xn), LIA.caption(`check: √(mean(x̂²)) = ${Math.sqrt(xn.reduce((a, v) => a + v * v, 0) / 8).toFixed(4)}`)),
+        note: "Every element is divided by the row's root-mean-square. Unlike LayerNorm, the mean is not subtracted.",
+      },
+      {
+        k: "Scale by γ",
+        op: "x̂ · weight",
+        where: "γ loaded once, reused by every row",
+        inLabel: "γ (mocked learned weight)",
+        input: () => row(gamma, { color: "var(--accent)", diverge: false }),
+        outLabel: "y",
+        output: () => h("div", { class: "stage", style: { gap: "8px" } }, row(y), loc(true)),
+        note: "γ is only 8 values here (8,192 in the real model). It stays in cache across rows, so it adds almost no traffic.",
+      },
+      {
+        k: "Store & tally bytes",
+        op: "tl.store(y_ptr + cols)",
+        where: "SRAM → HBM · 1 write",
+        inLabel: "y",
+        input: () => h("div", { class: "stage", style: { gap: "8px" } }, row(y), loc(false)),
+        outLabel: `Bytes per row at real H = ${fmt.num(H)} (fp16)`,
+        output: () => LIA.hbar({ width: 380, labelW: 110, valW: 80, rowH: 26, fmt: (v) => fmt.bytes(v), rows: [{ label: "unfused (7 passes)", value: unfusedB, color: "var(--hbm)" }, { label: "fused (2 passes)", value: fusedB, color: "var(--sram)" }] }),
+        note: `Unfused PyTorch writes x², ms, rstd and x̂ back to HBM between kernels. Fused, this token's row costs ${fmt.bytes(fusedB)} instead of ${fmt.bytes(unfusedB)}: 3.5× less traffic.`,
+      },
+    ];
+  }
 })();
